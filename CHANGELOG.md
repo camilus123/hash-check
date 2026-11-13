@@ -1,8 +1,31 @@
 # Changelog
 
 Versions are `x.y.z`: `x` for major changes, `y` for added features, `z` for
-bug fixes. `1.0.0` will be the first release that meets the whole project
-brief.
+bug fixes. `1.0.0` is the first release that meets the whole project brief.
+
+## 1.0.0 (2026-11-13)
+
+First complete release.
+
+### Added
+- Hard links: a file with several names is read once per Add run and every
+  name is tracked with the same hash.
+- Online-only cloud files (OneDrive and similar placeholders) are skipped
+  with a clear message instead of being downloaded.
+- When a whole drive is added, the recycle bin and "System Volume
+  Information" at its top level are left out.
+- A log of every job with its result and problems, in
+  `logs\hash-check.log` next to the program (rotated at 8 MB).
+- Tools > Check database: SQLite's full integrity check on demand.
+- Benchmark results for the reference machine in the README.
+
+### Changed
+- Direct I/O (reading past the file cache) is now on by default: the
+  benchmarks showed no speed difference on NVMe, SATA SSD or hard disk, and
+  it guarantees that verified data comes from the drive. It can be switched
+  off in the Tools menu.
+- While a job runs, the entry list is reloaded less often on very large
+  databases so the window stays responsive.
 
 ## 0.4.1 (2026-11-13)
 

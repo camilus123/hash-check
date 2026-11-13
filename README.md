@@ -8,10 +8,6 @@ time do not).
 Primary target: Windows 11 x64. The code also builds and passes its tests
 on Linux.
 
-> **Status: 0.4.1, fourth milestone.** All features are in place. What is
-> left for 1.0.0 is a robustness pass and real benchmark numbers (see
-> [Roadmap](#roadmap)).
-
 ## The read-only guarantee
 
 hash-check never modifies, renames, moves or deletes your files.
@@ -95,6 +91,9 @@ Everything lives next to `hash-check.exe`:
 | `hash-check.db` | The SQLite database (plus `-wal`/`-shm` files while running) |
 | `hash-check.db.backup-v<N>-<time>` | Automatic copy made before a schema upgrade |
 | `reports\` | Exported verification reports (unless you pick another location) |
+| `logs\hash-check.log` | A line or more per job: what ran, the result, every problem |
+
+Settings (threads per drive, direct I/O) are stored inside the database.
 
 Per file the database holds: full path, size, modified time, hash,
 algorithm, time first hashed, time last verified and the last result. The
@@ -144,6 +143,8 @@ cargo test
 - **Scheduling**: 1, 2, 8 and 32 threads and direct I/O all produce the
   same database; parallel and sequential Verify agree file by file; the
   benchmark changes nothing; drive detection runs on the test machine.
+- **Robustness**: hard links read once, the job log, the database check,
+  skipping of the recycle bin at a drive root.
 - **Read-only audit**: described above, plus a check that drive detection
   opens volumes with no access rights.
 
@@ -164,8 +165,9 @@ Work is scheduled per physical drive, and all drives run at the same time:
 - **Unknown or removable**: treated like a hard disk.
 
 The **Drives** list in the left panel shows what was detected and lets you
-override the number of parallel files per drive. **Tools > Read past the
-file cache** switches to direct I/O.
+override the number of parallel files per drive. Reads bypass the operating system's file cache (direct I/O), so verified
+data really comes from the drive; **Tools > Read past the file cache**
+switches that off.
 
 All three algorithms pick the fastest instructions the CPU offers at
 runtime (AVX2/SSE4.1 for BLAKE3 and XXH3, SHA extensions for SHA-256),
@@ -173,22 +175,65 @@ with portable fallbacks.
 
 ## Benchmarks
 
-**Tools > Benchmark…** measures your own drives: choose a folder or files
-(they are only read), and it reports MB/s for each algorithm, reading past
-the file cache so the drive is really measured, plus in-memory figures.
+Measured with the built-in benchmark (**Tools > Benchmark…**) of version
+0.4.1 on a Ryzen 9 5950X (16 cores, 32 threads, AVX2 and SHA extensions),
+64 GB RAM, Windows 11. Each figure is MB/s over about 8 GB of existing
+files, read past the file cache.
 
-Numbers for the reference machine (Ryzen 9 5950X, NVMe SSD, SATA SSD and a
-12 TB hard disk) will be added here for 1.0.0.
+| Drive | Connection | How it is read | BLAKE3 | XXH3-128 | SHA-256 |
+|---|---|---|---:|---:|---:|
+| Samsung 990 Pro 4 TB | NVMe, PCIe 4.0 x4 | 16 files in parallel | 6 352 | 6 523 | 6 206 |
+| Samsung 980 Pro 1 TB | NVMe, in a PCIe 3.0 x4 slot | 16 files in parallel | 2 758 | 2 854 | 2 105 |
+| Samsung 860 EVO 1 TB | SATA SSD | 4 files in parallel | 515 | 407 | 536 |
+| Samsung 840 EVO 500 GB | SATA SSD | 4 files in parallel | 525 | 525 | 523 |
+| Seagate IronWolf 12 TB | SATA hard disk | 1 file at a time | 238 | 242 | 243 |
+| WD Elements 18 TB | USB 3 hard disk | 1 file at a time | 221 | 222 | 222 |
 
-## Roadmap
+The same algorithms on data already in memory, to show what the CPU alone
+can do:
 
-| Version | Content |
-|---|---|
-| 0.1.0 | Core hashing, database, tests, CI, minimal window |
-| 0.2.0 | Full GUI: roots panel, Remove, Update with confirmations, Pause |
-| 0.3.0 | Verify (OK / Changed / Possibly corrupted / Missing / Unreadable / New), filters, CSV and text reports |
-| 0.4.0 | Per-drive threading, sequential HDD mode, drive settings, benchmark (this version) |
-| 1.0.0 | Robustness pass and benchmark results |
+| Algorithm | MB/s |
+|---|---:|
+| BLAKE3, all cores | about 47 000 |
+| BLAKE3, 1 thread | about 4 700 |
+| XXH3-128, 1 thread | about 25 000 |
+| SHA-256, 1 thread (SHA extensions) | about 2 200 |
+
+What the numbers say:
+
+- On every drive the drive is the limit, not the hashing. All three
+  algorithms run at the speed the device can deliver, so the default
+  (BLAKE3, cryptographic) costs nothing compared with the fastest one.
+- Direct reads and normal reads were equally fast everywhere (BLAKE3,
+  direct against normal: 6 352 / 6 409, 2 758 / 2 675, 515 / 526,
+  525 / 525, 238 / 243, 221 / 222). Direct I/O is therefore the default,
+  because it also guarantees the data comes from the drive.
+- The 990 Pro sample was only 3.3 GB and took half a second, so its
+  figures are coarse. The 407 MB/s for XXH3 on the 860 EVO (911 small
+  files) is an unexplained outlier; the other two algorithms reached the
+  SATA limit on the same files.
+
+To measure your own drives, choose a folder or files in the benchmark
+dialog. They are only read.
+
+## Known limitations
+
+- File names that are not valid Unicode cannot be tracked; they are
+  reported as problems.
+- Hard links are recognised within one Add run. Names of the same file
+  added in separate runs are each read.
+- Running two copies of hash-check on the same folder at once is safe for
+  the database but not prevented; one will wait for the other.
+- Drive type detection exists on Windows only. Elsewhere every drive is
+  read one file at a time unless you set a number in the Drives list.
+- With millions of entries, switching the view (a root, a filter) takes
+  around a second.
+
+## Version history
+
+See [CHANGELOG.md](CHANGELOG.md). Milestones: 0.1.0 core hashing and
+database, 0.2.0 full window, 0.3.0 verification and reports, 0.4.0
+per-drive performance and benchmark, 1.0.0 robustness and benchmarks.
 
 ## Licence
 
