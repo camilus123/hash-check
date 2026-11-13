@@ -39,6 +39,22 @@ pub const MIGRATIONS: &[&str] = &[
      );
      CREATE INDEX files_root   ON files(root_id);
      CREATE INDEX files_result ON files(last_result);",
+    // v2: verification runs, and files found under a root that are not tracked yet.
+    "ALTER TABLE files ADD COLUMN last_run INTEGER NOT NULL DEFAULT 0;
+     CREATE INDEX files_run ON files(last_run);
+     CREATE TABLE new_files (
+         id        INTEGER PRIMARY KEY,
+         path      TEXT    NOT NULL UNIQUE,
+         root_id   INTEGER NOT NULL REFERENCES roots(id),
+         size      INTEGER NOT NULL,
+         mtime_ns  INTEGER NOT NULL,
+         found_at  INTEGER NOT NULL
+     );
+     CREATE INDEX new_files_root ON new_files(root_id);
+     CREATE TABLE meta (
+         key    TEXT PRIMARY KEY,
+         value  TEXT NOT NULL
+     );",
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -131,6 +147,56 @@ pub struct Entry {
     pub last_verified: i64,
     pub status: Status,
     pub last_error: Option<String>,
+    /// Id of the verification run that last looked at this entry (0 = never).
+    pub last_run: i64,
+}
+
+/// A file found under a tracked root that is not in the database.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewFile {
+    pub id: i64,
+    pub path: String,
+    pub root_id: i64,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub found_at: i64,
+}
+
+/// Which entries a list shows, beyond the [`Scope`].
+#[derive(Clone, Debug, Default)]
+pub struct Filter<'a> {
+    pub scope: Option<Scope>,
+    /// Part of the path (case-insensitive for ASCII letters).
+    pub search: &'a str,
+    pub status: Option<Status>,
+    /// Only entries looked at by this verification run.
+    pub run: Option<i64>,
+}
+
+/// Entries per status.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatusCounts {
+    pub ok: u64,
+    pub changed: u64,
+    pub possibly_corrupted: u64,
+    pub missing: u64,
+    pub unreadable: u64,
+}
+
+impl StatusCounts {
+    pub fn get(&self, s: Status) -> u64 {
+        match s {
+            Status::Ok => self.ok,
+            Status::Changed => self.changed,
+            Status::PossiblyCorrupted => self.possibly_corrupted,
+            Status::Missing => self.missing,
+            Status::Unreadable => self.unreadable,
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.ok + self.changed + self.possibly_corrupted + self.missing + self.unreadable
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -262,7 +328,9 @@ impl Db {
     /// Forget a root only if it has no entries. Returns whether it was removed.
     pub fn delete_root_if_empty(&self, root_id: i64) -> DbResult<bool> {
         let n = self.conn.execute(
-            "DELETE FROM roots WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM files WHERE root_id = ?1)",
+            "DELETE FROM roots WHERE id = ?1
+               AND NOT EXISTS (SELECT 1 FROM files WHERE root_id = ?1)
+               AND NOT EXISTS (SELECT 1 FROM new_files WHERE root_id = ?1)",
             params![root_id],
         )?;
         Ok(n == 1)
@@ -315,6 +383,12 @@ impl Db {
             e.now,
             Status::Ok.id()
         ])?;
+        if n == 1 {
+            // A tracked file is no longer "new".
+            self.conn
+                .prepare_cached("DELETE FROM new_files WHERE path = ?1")?
+                .execute(params![e.path])?;
+        }
         Ok(n == 1)
     }
 
@@ -345,66 +419,238 @@ impl Db {
     pub fn entry(&self, id: i64) -> DbResult<Option<Entry>> {
         let mut st = self.conn.prepare_cached(
             "SELECT id, path, root_id, size, mtime_ns, algo, hash, first_hashed, last_verified,
-                    last_result, last_error
+                    last_result, last_error, last_run
              FROM files WHERE id = ?1",
         )?;
-        let raw = st
-            .query_row(params![id], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<i64>>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, i64>(5)?,
-                    r.get::<_, Vec<u8>>(6)?,
-                    r.get::<_, i64>(7)?,
-                    r.get::<_, i64>(8)?,
-                    r.get::<_, i64>(9)?,
-                    r.get::<_, Option<String>>(10)?,
-                ))
-            })
-            .optional()?;
-        let Some((
-            id,
-            path,
-            root_id,
-            size,
-            mtime_ns,
-            algo,
-            hash,
-            first_hashed,
-            last_verified,
-            res,
-            last_error,
-        )) = raw
-        else {
+        let mut rows = st.query(params![id])?;
+        let Some(r) = rows.next()? else {
             return Ok(None);
         };
-        let algo = Algo::from_id(algo).ok_or_else(|| {
-            DbError::BadData(format!("unknown hash algorithm id {algo} for {path}"))
+        let path: String = r.get(1)?;
+        let algo_id: i64 = r.get(5)?;
+        let res: i64 = r.get(9)?;
+        let algo = Algo::from_id(algo_id).ok_or_else(|| {
+            DbError::BadData(format!("unknown hash algorithm id {algo_id} for {path}"))
         })?;
         let status = Status::from_id(res)
             .ok_or_else(|| DbError::BadData(format!("unknown result id {res} for {path}")))?;
         Ok(Some(Entry {
-            id,
+            id: r.get(0)?,
             path,
-            root_id,
-            size: size as u64,
-            mtime_ns,
+            root_id: r.get(2)?,
+            size: r.get::<_, i64>(3)? as u64,
+            mtime_ns: r.get(4)?,
             algo,
-            hash,
-            first_hashed,
-            last_verified,
+            hash: r.get(6)?,
+            first_hashed: r.get(7)?,
+            last_verified: r.get(8)?,
             status,
-            last_error,
+            last_error: r.get(10)?,
+            last_run: r.get(11)?,
         }))
     }
 
     /// Ids in path order, limited to `scope` and to paths containing
     /// `search` (case-insensitive for ASCII letters).
     pub fn ids_filtered(&self, scope: Scope, search: &str) -> DbResult<Vec<i64>> {
+        self.ids_matching(&Filter {
+            scope: Some(scope),
+            search,
+            ..Default::default()
+        })
+    }
+
+    /// Ids in path order of the entries matching `filter`.
+    pub fn ids_matching(&self, filter: &Filter<'_>) -> DbResult<Vec<i64>> {
         let mut sql = String::from("SELECT id FROM files WHERE 1");
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        scope_clause(filter.scope, &mut sql, &mut args);
+        search_clause(filter.search, &mut sql, &mut args);
+        if let Some(status) = filter.status {
+            sql += " AND last_result = ?";
+            args.push(status.id().into());
+        }
+        if let Some(run) = filter.run {
+            sql += " AND last_run = ?";
+            args.push(run.into());
+        }
+        sql += " ORDER BY path";
+        let mut st = self.conn.prepare(&sql)?;
+        let rows = st.query_map(rusqlite::params_from_iter(args), |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Entries per status within `scope`, optionally only those looked at by `run`.
+    pub fn status_counts(&self, scope: Option<Scope>, run: Option<i64>) -> DbResult<StatusCounts> {
+        let mut sql = String::from("SELECT last_result, COUNT(*) FROM files WHERE 1");
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        scope_clause(scope, &mut sql, &mut args);
+        if let Some(run) = run {
+            sql += " AND last_run = ?";
+            args.push(run.into());
+        }
+        sql += " GROUP BY last_result";
+        let mut st = self.conn.prepare(&sql)?;
+        let mut rows = st.query(rusqlite::params_from_iter(args))?;
+        let mut c = StatusCounts::default();
+        while let Some(r) = rows.next()? {
+            let n = r.get::<_, i64>(1)? as u64;
+            match Status::from_id(r.get(0)?) {
+                Some(Status::Ok) => c.ok = n,
+                Some(Status::Changed) => c.changed = n,
+                Some(Status::PossiblyCorrupted) => c.possibly_corrupted = n,
+                Some(Status::Missing) => c.missing = n,
+                Some(Status::Unreadable) => c.unreadable = n,
+                None => {}
+            }
+        }
+        Ok(c)
+    }
+
+    /// Total stored size of the entries in `scope`.
+    pub fn size_in_scope(&self, scope: Scope) -> DbResult<u64> {
+        let mut sql = String::from("SELECT COALESCE(SUM(size), 0) FROM files WHERE 1");
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        scope_clause(Some(scope), &mut sql, &mut args);
+        let n: i64 = self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(args), |r| r.get(0))?;
+        Ok(n as u64)
+    }
+
+    /// Total stored size of the given entries.
+    pub fn size_of(&self, ids: &[i64]) -> DbResult<u64> {
+        let mut total = 0u64;
+        for chunk in ids.chunks(ID_CHUNK) {
+            let sql = format!(
+                "SELECT COALESCE(SUM(size), 0) FROM files WHERE id IN ({})",
+                placeholders(chunk.len())
+            );
+            let n: i64 = self
+                .conn
+                .query_row(&sql, rusqlite::params_from_iter(chunk), |r| r.get(0))?;
+            total += n as u64;
+        }
+        Ok(total)
+    }
+
+    // ---- verification ----
+
+    /// Start a new verification run and return its id (1, 2, 3, ...).
+    pub fn begin_run(&mut self) -> DbResult<i64> {
+        let tx = self.conn.transaction()?;
+        let last: i64 = tx
+            .query_row("SELECT value FROM meta WHERE key = 'last_run'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let run = last + 1;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('last_run', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![run.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(run)
+    }
+
+    /// Id of the most recent verification run (0 if there was none).
+    pub fn last_run(&self) -> DbResult<i64> {
+        Ok(self
+            .meta("last_run")?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0))
+    }
+
+    pub fn meta(&self, key: &str) -> DbResult<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> DbResult<()> {
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Verification found the file intact. Size and modified time are
+    /// refreshed (a file can be touched without its content changing); the
+    /// stored hash is, as always, left alone.
+    pub fn record_verified_ok(
+        &self,
+        id: i64,
+        size: u64,
+        mtime_ns: i64,
+        now: i64,
+        run: i64,
+    ) -> DbResult<bool> {
+        let size =
+            i64::try_from(size).map_err(|_| DbError::BadData("file size too large".into()))?;
+        let mut st = self.conn.prepare_cached(
+            "UPDATE files SET size = ?2, mtime_ns = ?3, last_verified = ?4, last_result = ?5,
+                              last_error = NULL, last_run = ?6
+             WHERE id = ?1",
+        )?;
+        Ok(st.execute(params![id, size, mtime_ns, now, Status::Ok.id(), run])? == 1)
+    }
+
+    /// Verification found a problem. Nothing but the result is stored: the
+    /// hash, size and modified time on record stay as they were, so the
+    /// same check gives the same answer next time.
+    pub fn record_verified_problem(
+        &self,
+        id: i64,
+        status: Status,
+        detail: &str,
+        now: i64,
+        run: i64,
+    ) -> DbResult<bool> {
+        let mut st = self.conn.prepare_cached(
+            "UPDATE files SET last_result = ?2, last_error = ?3, last_verified = ?4, last_run = ?5
+             WHERE id = ?1",
+        )?;
+        Ok(st.execute(params![id, status.id(), detail, now, run])? == 1)
+    }
+
+    // ---- new (untracked) files ----
+
+    /// Forget earlier findings for a root before it is scanned again.
+    pub fn clear_new_files(&self, root_id: i64) -> DbResult<()> {
+        self.conn
+            .execute("DELETE FROM new_files WHERE root_id = ?1", params![root_id])?;
+        Ok(())
+    }
+
+    pub fn insert_new_file(
+        &self,
+        path: &str,
+        root_id: i64,
+        size: u64,
+        mtime_ns: i64,
+        now: i64,
+    ) -> DbResult<()> {
+        let size =
+            i64::try_from(size).map_err(|_| DbError::BadData("file size too large".into()))?;
+        let mut st = self.conn.prepare_cached(
+            "INSERT OR IGNORE INTO new_files(path, root_id, size, mtime_ns, found_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        st.execute(params![path, root_id, size, mtime_ns, now])?;
+        Ok(())
+    }
+
+    /// Ids of new files in path order, limited to a root and a search text.
+    pub fn new_file_ids(&self, scope: Scope, search: &str) -> DbResult<Vec<i64>> {
+        let mut sql = String::from("SELECT id FROM new_files WHERE 1");
         let mut args: Vec<rusqlite::types::Value> = Vec::new();
         match scope {
             Scope::All => {}
@@ -412,25 +658,54 @@ impl Db {
                 sql += " AND root_id = ?";
                 args.push(id.into());
             }
-            Scope::Loose => sql += " AND root_id IS NULL",
+            // New files are only ever found under roots.
+            Scope::Loose => sql += " AND 0",
         }
-        if !search.is_empty() {
-            let mut pat = String::with_capacity(search.len() + 2);
-            pat.push('%');
-            for c in search.chars() {
-                if matches!(c, '%' | '_' | '\\') {
-                    pat.push('\\');
-                }
-                pat.push(c);
-            }
-            pat.push('%');
-            sql += " AND path LIKE ? ESCAPE '\\'";
-            args.push(pat.into());
-        }
+        search_clause(search, &mut sql, &mut args);
         sql += " ORDER BY path";
         let mut st = self.conn.prepare(&sql)?;
         let rows = st.query_map(rusqlite::params_from_iter(args), |r| r.get(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn new_file(&self, id: i64) -> DbResult<Option<NewFile>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT id, path, root_id, size, mtime_ns, found_at FROM new_files WHERE id = ?1",
+        )?;
+        Ok(st
+            .query_row(params![id], |r| {
+                Ok(NewFile {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    root_id: r.get(2)?,
+                    size: r.get::<_, i64>(3)? as u64,
+                    mtime_ns: r.get(4)?,
+                    found_at: r.get(5)?,
+                })
+            })
+            .optional()?)
+    }
+
+    pub fn count_new_files(&self, scope: Scope) -> DbResult<u64> {
+        let n: i64 = match scope {
+            Scope::All => self
+                .conn
+                .query_row("SELECT COUNT(*) FROM new_files", [], |r| r.get(0))?,
+            Scope::Root(id) => self.conn.query_row(
+                "SELECT COUNT(*) FROM new_files WHERE root_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )?,
+            Scope::Loose => 0,
+        };
+        Ok(n as u64)
+    }
+
+    pub fn delete_new_file(&self, id: i64) -> DbResult<()> {
+        self.conn
+            .prepare_cached("DELETE FROM new_files WHERE id = ?1")?
+            .execute(params![id])?;
+        Ok(())
     }
 
     /// Number of entries per root, and the number of loose entries.
@@ -472,6 +747,7 @@ impl Db {
     pub fn delete_root(&mut self, root_id: i64) -> DbResult<u64> {
         let tx = self.conn.transaction()?;
         let n = tx.execute("DELETE FROM files WHERE root_id = ?1", params![root_id])? as u64;
+        tx.execute("DELETE FROM new_files WHERE root_id = ?1", params![root_id])?;
         tx.execute("DELETE FROM roots WHERE id = ?1", params![root_id])?;
         tx.commit()?;
         Ok(n)
@@ -527,6 +803,35 @@ impl Db {
         }
         Ok(total)
     }
+}
+
+fn scope_clause(scope: Option<Scope>, sql: &mut String, args: &mut Vec<rusqlite::types::Value>) {
+    match scope {
+        None | Some(Scope::All) => {}
+        Some(Scope::Root(id)) => {
+            *sql += " AND root_id = ?";
+            args.push(id.into());
+        }
+        Some(Scope::Loose) => *sql += " AND root_id IS NULL",
+    }
+}
+
+/// Add a "path contains" condition, taking LIKE wildcards literally.
+fn search_clause(search: &str, sql: &mut String, args: &mut Vec<rusqlite::types::Value>) {
+    if search.is_empty() {
+        return;
+    }
+    let mut pat = String::with_capacity(search.len() + 2);
+    pat.push('%');
+    for c in search.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            pat.push('\\');
+        }
+        pat.push(c);
+    }
+    pat.push('%');
+    *sql += " AND path LIKE ? ESCAPE '\\'";
+    args.push(pat.into());
 }
 
 fn placeholders(n: usize) -> String {

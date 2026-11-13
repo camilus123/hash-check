@@ -204,18 +204,24 @@ fn killed_writer_leaves_a_sound_database() {
     }
 }
 
+/// The current schema plus one more (pretend) migration.
+fn next_schema(extra: &'static str) -> Vec<&'static str> {
+    let mut v: Vec<&str> = MIGRATIONS.to_vec();
+    v.push(extra);
+    v
+}
+
 #[test]
 fn migration_backs_up_first_and_keeps_data() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.db");
-    let v1: &[&str] = &MIGRATIONS[..1];
     {
-        let db = Db::open_with(&path, v1).unwrap();
+        let db = Db::open(&path).unwrap();
         insert(&db, "/precious", Algo::Sha256, b"data");
     }
-    let v2: Vec<&str> = vec![MIGRATIONS[0], "ALTER TABLE files ADD COLUMN note TEXT"];
-    let db = Db::open_with(&path, &v2).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 2);
+    let next = next_schema("ALTER TABLE files ADD COLUMN note TEXT");
+    let db = Db::open_with(&path, &next).unwrap();
+    assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION + 1);
     assert!(db.file_exists("/precious").unwrap());
     assert!(db.integrity_check().unwrap());
 
@@ -229,62 +235,67 @@ fn migration_backs_up_first_and_keeps_data() {
         path.parent(),
         "backup must sit next to the database"
     );
+    let prefix = format!("t.db.backup-v{SCHEMA_VERSION}-");
     assert!(
         backup
             .file_name()
             .unwrap()
             .to_string_lossy()
-            .starts_with("t.db.backup-v1-")
+            .starts_with(&prefix)
     );
-    let old = Db::open_with(&backup, v1).unwrap();
+    let old = Db::open(&backup).unwrap();
     assert_eq!(
         old.schema_version().unwrap(),
-        1,
+        SCHEMA_VERSION,
         "backup must hold the old schema"
     );
+    assert!(old.backup_made.is_none());
     assert!(old.file_exists("/precious").unwrap());
     assert!(old.integrity_check().unwrap());
 
     // Opening again at the same version migrates nothing and backs up nothing.
     drop(db);
-    assert!(Db::open_with(&path, &v2).unwrap().backup_made.is_none());
+    assert!(Db::open_with(&path, &next).unwrap().backup_made.is_none());
 }
 
 #[test]
 fn failed_migration_changes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.db");
-    let v1: &[&str] = &MIGRATIONS[..1];
     {
-        let db = Db::open_with(&path, v1).unwrap();
+        let db = Db::open(&path).unwrap();
         insert(&db, "/precious", Algo::Blake3, b"data");
     }
-    let broken: Vec<&str> = vec![
-        MIGRATIONS[0],
-        "ALTER TABLE files ADD COLUMN note TEXT; THIS IS NOT SQL;",
-    ];
+    let broken = next_schema("ALTER TABLE files ADD COLUMN note TEXT; THIS IS NOT SQL;");
     assert!(Db::open_with(&path, &broken).is_err());
-    let db = Db::open_with(&path, v1).unwrap();
+    let db = Db::open(&path).unwrap();
     assert_eq!(
         db.schema_version().unwrap(),
-        1,
+        SCHEMA_VERSION,
         "version must not advance on failure"
     );
     assert!(db.file_exists("/precious").unwrap());
     assert!(db.integrity_check().unwrap());
+    // The half-applied column must have been rolled back with the rest.
+    assert!(
+        Db::open_with(
+            &path,
+            &next_schema("ALTER TABLE files ADD COLUMN note TEXT")
+        )
+        .is_ok()
+    );
 }
 
 #[test]
 fn database_from_a_newer_version_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.db");
-    let future: Vec<&str> = vec![MIGRATIONS[0], "CREATE TABLE from_the_future (x)"];
+    let future = next_schema("CREATE TABLE from_the_future (x)");
     drop(Db::open_with(&path, &future).unwrap());
     match Db::open(&path) {
-        Err(DbError::NewerSchema {
-            found: 2,
-            supported,
-        }) => assert_eq!(supported, SCHEMA_VERSION),
+        Err(DbError::NewerSchema { found, supported }) => {
+            assert_eq!((found, supported), (SCHEMA_VERSION + 1, SCHEMA_VERSION));
+        }
         Err(e) => panic!("wrong error: {e}"),
         Ok(_) => panic!("a newer database must not be opened"),
     }
@@ -294,7 +305,7 @@ fn database_from_a_newer_version_is_refused() {
             .unwrap()
             .schema_version()
             .unwrap(),
-        2
+        SCHEMA_VERSION + 1
     );
 }
 
@@ -311,4 +322,72 @@ fn status_ids_are_stable() {
         assert_eq!(s.id(), id);
         assert_eq!(Status::from_id(id), Some(s));
     }
+}
+
+/// The real upgrade path users take: a database written by 0.1/0.2
+/// (schema 1) opened by the current version. The old database is built
+/// with plain SQL, exactly as those versions stored it.
+#[test]
+fn real_upgrade_from_schema_1_keeps_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hash-check.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute(
+            "INSERT INTO roots(id, path, recursive, added_at) VALUES (1, '/data', 1, 1)",
+            [],
+        )
+        .unwrap();
+        for i in 0..50i64 {
+            conn.execute(
+                "INSERT INTO files(path, root_id, size, mtime_ns, algo, hash, first_hashed, last_verified, last_result)
+                 VALUES (?1, 1, ?2, ?3, 1, ?4, 7, 7, 1)",
+                rusqlite::params![format!("/data/f{i:02}"), i, 1000 + i, hash_bytes(Algo::Blake3, &[i as u8])],
+            )
+            .unwrap();
+        }
+    }
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+    let backup = db.backup_made.clone().expect("upgrade must back up first");
+    assert!(
+        backup
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("hash-check.db.backup-v1-")
+    );
+    {
+        let old = rusqlite::Connection::open(&backup).unwrap();
+        let (version, files): (i64, i64) = (
+            old.query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap(),
+            old.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+                .unwrap(),
+        );
+        assert_eq!(
+            (version, files),
+            (1, 50),
+            "the backup is the untouched old database"
+        );
+    }
+    assert!(db.integrity_check().unwrap());
+    assert_eq!(db.count_files().unwrap(), 50);
+    assert_eq!(db.last_run().unwrap(), 0);
+    assert_eq!(db.roots().unwrap().len(), 1);
+    for id in db.all_ids().unwrap() {
+        let e = db.entry(id).unwrap().unwrap();
+        assert_eq!(e.hash, hash_bytes(Algo::Blake3, &[e.size as u8]));
+        assert_eq!(
+            (e.status, e.last_run, e.mtime_ns),
+            (Status::Ok, 0, 1000 + e.size as i64)
+        );
+        assert_eq!(e.root_id, Some(1));
+    }
+    assert_eq!(db.count_new_files(hash_check::db::Scope::All).unwrap(), 0);
+    // And it is fully usable afterwards.
+    assert!(insert(&db, "/data/after-upgrade", Algo::Sha256, b"x"));
 }
