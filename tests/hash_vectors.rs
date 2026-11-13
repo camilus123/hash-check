@@ -168,6 +168,7 @@ fn files_hash_to_reference_including_larger_than_buffer() {
                 algo,
                 &mut buf,
                 HashOpts { parallel, direct },
+                None,
                 &mut |b| {
                     seen += b;
                     true

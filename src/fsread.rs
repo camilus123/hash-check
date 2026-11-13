@@ -22,6 +22,17 @@ pub struct FileMeta {
     /// Modification time, nanoseconds since the Unix epoch (may be negative).
     pub mtime_ns: i64,
     pub kind: Kind,
+    /// An online-only cloud placeholder (OneDrive and similar): reading
+    /// it would make the sync client download the file.
+    pub cloud_only: bool,
+}
+
+/// Identifies a file independently of its name: two paths with the same
+/// identity are hard links to the same data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FileId {
+    pub volume: u64,
+    pub index: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,7 +71,46 @@ fn meta_from(m: &fs::Metadata) -> FileMeta {
         size: m.len(),
         mtime_ns: mtime_ns(m.modified()),
         kind,
+        cloud_only: is_cloud_only(m),
     }
+}
+
+#[cfg(windows)]
+fn is_cloud_only(m: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
+    const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x4_0000;
+    const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x40_0000;
+    m.file_attributes()
+        & (FILE_ATTRIBUTE_OFFLINE
+            | FILE_ATTRIBUTE_RECALL_ON_OPEN
+            | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+        != 0
+}
+
+#[cfg(not(windows))]
+fn is_cloud_only(_m: &fs::Metadata) -> bool {
+    false
+}
+
+/// Folders Windows keeps at the top of every drive that are not the
+/// user's files: the recycle bin and the restore-point store. They are
+/// skipped when a whole drive is added.
+pub fn is_system_folder_at_volume_root(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let at_root = path.parent().is_some_and(|p| p.parent().is_none());
+    at_root
+        && [
+            "$RECYCLE.BIN",
+            "System Volume Information",
+            "$Recycle.Bin",
+            "RECYCLER",
+            "$WinREAgent",
+        ]
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(name))
 }
 
 /// Metadata of `path` itself; links are reported as links, not followed.
@@ -160,6 +210,12 @@ impl ReadOnlyFile {
         self.f.metadata().map(|m| meta_from(&m))
     }
 
+    /// The file's identity, but only if it has more than one name (hard
+    /// links); `None` for ordinary files and when the system cannot tell.
+    pub fn link_identity(&self) -> Option<FileId> {
+        link_identity(&self.f)
+    }
+
     /// Read up to `buf.len()` bytes; 0 means end of file.
     pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
@@ -190,6 +246,45 @@ pub fn read_whole(path: &Path, max: u64) -> io::Result<Vec<u8>> {
     }
     data.truncate(filled);
     Ok(data)
+}
+
+#[cfg(unix)]
+fn link_identity(f: &fs::File) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    let m = f.metadata().ok()?;
+    (m.nlink() > 1).then(|| FileId {
+        volume: m.dev(),
+        index: m.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn link_identity(f: &fs::File) -> Option<FileId> {
+    use std::os::windows::io::AsRawHandle;
+    // BY_HANDLE_FILE_INFORMATION is thirteen 32-bit fields:
+    // attributes, 3 x FILETIME (2 fields each), volume serial, size high,
+    // size low, number of links, index high, index low.
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(file: *mut std::ffi::c_void, info: *mut [u32; 13]) -> i32;
+    }
+    let mut info = [0u32; 13];
+    // SAFETY: the handle is open for the lifetime of `f`, and `info` has
+    // exactly the size and alignment of BY_HANDLE_FILE_INFORMATION. The
+    // call only reads metadata.
+    let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle().cast(), &mut info) };
+    if ok == 0 || info[10] <= 1 {
+        return None;
+    }
+    Some(FileId {
+        volume: info[7] as u64,
+        index: ((info[11] as u64) << 32) | info[12] as u64,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn link_identity(_f: &fs::File) -> Option<FileId> {
+    None
 }
 
 /// What [`walk`] reports.
@@ -250,7 +345,7 @@ pub fn walk(dir: &Path, recursive: bool, visit: &mut dyn FnMut(WalkItem<'_>) -> 
                 Kind::File => visit(WalkItem::File { path: &path, meta }),
                 Kind::Link => visit(WalkItem::SkippedLink { path: &path }),
                 Kind::Dir => {
-                    if recursive {
+                    if recursive && !is_system_folder_at_volume_root(&path) {
                         subdirs.push(path);
                     }
                     true

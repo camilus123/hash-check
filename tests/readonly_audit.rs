@@ -24,7 +24,7 @@ const MUTATING: &[&str] = &[
     "set_len",
     "set_modified",
     "set_times",
-    "hard_link",
+    "hard_link(",
     "::symlink(",
     "symlink_file",
     "symlink_dir",
@@ -128,12 +128,25 @@ fn drive_detection_opens_volumes_without_any_access_rights() {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let text = std::fs::read_to_string(&path).unwrap();
         if name != "drives.rs" {
-            for token in [
-                "CreateFileW",
-                "DeviceIoControl",
-                "extern \"system\"",
-                "#[link(",
-            ] {
+            // fsread may ask Windows one read-only question about an open
+            // handle (is this file a hard link?); nothing else may call out.
+            let allowed = if name == "fsread.rs" { 1 } else { 0 };
+            assert_eq!(
+                text.matches("extern \"system\"").count(),
+                allowed,
+                "{name}: unexpected Windows API declarations"
+            );
+            if name == "fsread.rs" {
+                assert!(text.contains("fn GetFileInformationByHandle("));
+                let declared = code_lines(&text)
+                    .filter(|(_, l)| l.trim_start().starts_with("fn Get"))
+                    .count();
+                assert_eq!(
+                    declared, 1,
+                    "fsread may declare exactly one Windows function"
+                );
+            }
+            for token in ["CreateFileW", "DeviceIoControl"] {
                 assert!(
                     !text.contains(token),
                     "{name} must not call the Windows API directly ({token})"
