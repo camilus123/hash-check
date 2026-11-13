@@ -28,7 +28,7 @@ First milestone: core hashing and database, with a minimal window.
 - List of tracked entries that stays fast with millions of rows.
 - Version shown in the window title and the About box.
 - GitHub Actions: tests on Windows and Linux, Windows `.exe` built on every
-  push and attached to tagged releases.
+  push and published as a release whenever the version number changes.
 
 ### Not yet implemented
 Remove, Update, Verify and reports, Pause, per-drive threading and drive

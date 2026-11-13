@@ -3,7 +3,6 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
 
 permissions:
@@ -46,23 +45,46 @@ jobs:
             target/release/hash-check.exe.sha256
           if-no-files-found: error
 
+  # When main carries a version in Cargo.toml that has no release yet, tag it
+  # (vX.Y.Z) and publish the Windows executable built above.
   release:
-    name: Publish release
+    name: Tag and publish new version
     needs: test
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
+      - name: Read version
+        id: v
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          test -n "$version"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+            echo "v$version already exists; nothing to publish."
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/download-artifact@v4
+        if: steps.v.outputs.new == 'true'
         with:
           name: hash-check-windows-x64
           path: dist
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Create tag and release
+        if: steps.v.outputs.new == 'true'
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/hash-check.exe dist/hash-check.exe.sha256 \
-            --title "hash-check ${GITHUB_REF_NAME#v}" \
-            --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md) for what changed."
+          # Release notes: this version's section of CHANGELOG.md.
+          awk -v v="${{ steps.v.outputs.version }}" '
+            /^## / { on = (index($0, "## " v " ") == 1) ; next }
+            on { print }' CHANGELOG.md > notes.md
+          test -s notes.md || echo "See CHANGELOG.md." > notes.md
+          gh release create "${{ steps.v.outputs.tag }}" dist/hash-check.exe dist/hash-check.exe.sha256 \
+            --target "$GITHUB_SHA" \
+            --title "hash-check ${{ steps.v.outputs.version }}" \
+            --notes-file notes.md
