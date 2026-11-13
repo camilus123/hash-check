@@ -2,9 +2,12 @@
 //! and all database changes happen on the job thread (see `engine`).
 
 use crate::appdata::AppDir;
-use crate::db::{Db, Entry, Root, Scope, Status};
-use crate::engine::{self, Job, JobKind, Phase, Shared, State};
+use crate::db::{Db, Entry, Filter, NewFile, Root, Scope, Status, StatusCounts};
+use crate::engine::{
+    self, ExportDest, Job, JobKind, Phase, Shared, State, VerifyCounts, VerifyTarget,
+};
 use crate::hasher::{Algo, to_hex};
+use crate::report::Format;
 use crate::util::{
     format_duration, format_unix_nanos, format_unix_secs, group_digits, human_bytes,
 };
@@ -70,6 +73,42 @@ pub fn run() {
     }
 }
 
+const ORANGE: egui::Color32 = egui::Color32::from_rgb(210, 110, 50);
+const AMBER: egui::Color32 = egui::Color32::from_rgb(200, 150, 40);
+const GREEN: egui::Color32 = egui::Color32::from_rgb(70, 160, 90);
+const BLUE: egui::Color32 = egui::Color32::from_rgb(70, 130, 220);
+
+fn status_color(status: Status) -> egui::Color32 {
+    match status {
+        Status::Ok => GREEN,
+        Status::Changed => AMBER,
+        Status::PossiblyCorrupted => RED,
+        Status::Missing | Status::Unreadable => ORANGE,
+    }
+}
+
+/// Which results the list shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Show {
+    All,
+    Status(Status),
+    /// Files found under a root that are not in the database.
+    New,
+}
+
+/// Summary of the last verification, kept on screen until dismissed.
+struct VerifySummary {
+    counts: VerifyCounts,
+    unavailable: Vec<(String, u64)>,
+    cancelled: bool,
+    changed_during: u64,
+}
+
+/// The "Export report" dialog.
+struct ExportDialog {
+    format: Format,
+}
+
 /// A question the user must answer before a job starts.
 enum Confirm {
     RemoveEntries {
@@ -98,6 +137,21 @@ struct App {
     selected: HashSet<i64>,
     /// Row index a Shift+click extends from.
     anchor: Option<usize>,
+    show: Show,
+    /// Limit the list to entries the last verification looked at.
+    last_run_only: bool,
+    /// Rows of the "New" view (`ids` then holds new-file ids).
+    new_cache: HashMap<i64, NewFile>,
+    /// Entries per status for the chips (within scope and "last run only").
+    counts: StatusCounts,
+    new_count: u64,
+    /// Entries flagged possibly corrupted in the whole database.
+    corrupted_total: u64,
+    corrupted_banner_dismissed: bool,
+    last_run: i64,
+    verify_summary: Option<VerifySummary>,
+    export: Option<ExportDialog>,
+    info: Option<String>,
 
     // Overview for the left panel.
     roots: Vec<Root>,
@@ -140,6 +194,17 @@ impl App {
             cache: HashMap::new(),
             selected: HashSet::new(),
             anchor: None,
+            show: Show::All,
+            last_run_only: false,
+            new_cache: HashMap::new(),
+            counts: StatusCounts::default(),
+            new_count: 0,
+            corrupted_total: 0,
+            corrupted_banner_dismissed: false,
+            last_run: 0,
+            verify_summary: None,
+            export: None,
+            info: None,
             roots: Vec::new(),
             root_counts: HashMap::new(),
             loose_count: 0,
@@ -177,7 +242,24 @@ impl App {
                 self.scope = Scope::All;
             }
             let (root_counts, loose) = self.db.root_counts()?;
-            let ids = self.db.ids_filtered(self.scope, self.search.trim())?;
+            let last_run = self.db.last_run()?;
+            let run = (self.last_run_only && last_run > 0).then_some(last_run);
+            let search = self.search.trim();
+            let ids = match self.show {
+                Show::New => self.db.new_file_ids(self.scope, search)?,
+                Show::All => self.db.ids_matching(&Filter {
+                    scope: Some(self.scope),
+                    search,
+                    status: None,
+                    run,
+                })?,
+                Show::Status(status) => self.db.ids_matching(&Filter {
+                    scope: Some(self.scope),
+                    search,
+                    status: Some(status),
+                    run,
+                })?,
+            };
             Ok::<_, crate::db::DbError>((
                 roots,
                 root_counts,
@@ -185,21 +267,53 @@ impl App {
                 ids,
                 self.db.count_files()?,
                 self.db.total_size()?,
+                self.db.status_counts(Some(self.scope), run)?,
+                self.db.count_new_files(self.scope)?,
+                self.db.status_counts(None, None)?.possibly_corrupted,
+                last_run,
             ))
         })();
         match loaded {
-            Ok((roots, root_counts, loose, ids, count, size)) => {
+            Ok((
+                roots,
+                root_counts,
+                loose,
+                ids,
+                count,
+                size,
+                counts,
+                new_count,
+                corrupted,
+                last_run,
+            )) => {
                 self.roots = roots;
                 self.root_counts = root_counts;
                 self.loose_count = loose;
                 self.ids = ids;
                 self.total_count = count;
                 self.total_size = size;
+                self.counts = counts;
+                self.new_count = new_count;
+                self.corrupted_total = corrupted;
+                self.last_run = last_run;
                 self.cache.clear();
+                self.new_cache.clear();
             }
             Err(e) => self.error = Some(e.to_string()),
         }
         self.last_list_refresh = Instant::now();
+    }
+
+    fn set_show(&mut self, show: Show) {
+        if self.show != show {
+            // Entry ids and new-file ids are different things: never carry a selection across.
+            if (self.show == Show::New) != (show == Show::New) {
+                self.selected.clear();
+            }
+            self.show = show;
+            self.anchor = None;
+            self.refresh();
+        }
     }
 
     fn set_scope(&mut self, scope: Scope) {
@@ -273,9 +387,24 @@ impl App {
 
         if state.phase == Phase::Finished {
             self.job = None;
-            if state.kind == JobKind::Remove {
+            if state.kind == JobKind::Remove || self.show == Show::New {
                 self.selected.clear();
                 self.anchor = None;
+            }
+            if state.kind == JobKind::Verify {
+                self.verify_summary = Some(VerifySummary {
+                    counts: state.verify.clone(),
+                    unavailable: state.unavailable_volumes.clone(),
+                    cancelled: state.cancelled,
+                    changed_during: state.changed_during_hash,
+                });
+                self.corrupted_banner_dismissed = false;
+            }
+            if state.kind == JobKind::Export
+                && state.fatal.is_none()
+                && let Some(path) = &state.report_path
+            {
+                self.info = Some(format!("Report saved:\n{}", path.display()));
             }
             self.last_job = Some(state.clone());
             self.refresh();
@@ -320,7 +449,60 @@ impl App {
             });
             ui.separator();
 
-            let can_act = idle && n_sel > 0;
+            ui.menu_button("Verify ▾", |ui| {
+                ui.set_min_width(260.0);
+                if ui
+                    .add_enabled(idle && self.total_count > 0, egui::Button::new("Verify everything"))
+                    .on_hover_text("Re-hash every tracked file and look for new files in every root.")
+                    .clicked()
+                {
+                    self.start_job(ui.ctx(), Job::Verify { target: VerifyTarget::All });
+                    ui.close();
+                }
+                let root = match self.scope {
+                    Scope::Root(id) => self.roots.iter().find(|r| r.id == id).cloned(),
+                    _ => None,
+                };
+                let root_label = match &root {
+                    Some(r) => format!("Verify root {}", r.path),
+                    None => "Verify the selected root".to_string(),
+                };
+                if ui
+                    .add_enabled(idle && root.is_some(), egui::Button::new(root_label).truncate())
+                    .on_disabled_hover_text("Click a root in the left panel first.")
+                    .clicked()
+                    && let Some(r) = root
+                {
+                    self.start_job(ui.ctx(), Job::Verify { target: VerifyTarget::Root(r.id) });
+                    ui.close();
+                }
+                let can_sel = idle && n_sel > 0 && self.show != Show::New;
+                if ui
+                    .add_enabled(can_sel, egui::Button::new(if can_sel {
+                        format!("Verify {} selected", group_digits(n_sel as u64))
+                    } else {
+                        "Verify selected entries".to_string()
+                    }))
+                    .on_disabled_hover_text("Select one or more entries first.")
+                    .clicked()
+                {
+                    let ids = self.selected_ids();
+                    self.start_job(ui.ctx(), Job::Verify { target: VerifyTarget::Entries(ids) });
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(idle && self.last_run > 0, egui::Button::new("Export last report…"))
+                    .on_disabled_hover_text("Run a verification first.")
+                    .clicked()
+                {
+                    self.export = Some(ExportDialog { format: Format::Csv });
+                    ui.close();
+                }
+            });
+            ui.separator();
+
+            let can_act = idle && n_sel > 0 && self.show != Show::New;
             if ui
                 .add_enabled(can_act, egui::Button::new("Update…"))
                 .on_hover_text("Re-hash the selected entries and replace their stored hashes. Use this for files you know you changed.")
@@ -430,6 +612,9 @@ impl App {
             ui.horizontal(|ui| {
                 let what = match (s.kind, s.phase) {
                     (_, Phase::Removing) => "Removing entries from the database…",
+                    (_, Phase::Writing) | (JobKind::Export, _) => "Writing report…",
+                    (JobKind::Verify, Phase::Preparing) => "Verifying: looking for new files…",
+                    (JobKind::Verify, _) => "Verifying…",
                     (JobKind::Add, Phase::Preparing) => "Scanning for files…",
                     (JobKind::Add, _) => "Adding: hashing new files…",
                     (JobKind::Update, Phase::Preparing) => "Preparing update…",
@@ -438,7 +623,7 @@ impl App {
                 };
                 ui.strong(if s.paused { "Paused" } else { what });
                 if let Some(job) = &self.job {
-                    if s.phase != Phase::Removing {
+                    if !matches!(s.phase, Phase::Removing | Phase::Writing) {
                         let label = if s.paused { "Resume" } else { "Pause" };
                         if ui.button(label).clicked() {
                             job.set_paused(!s.paused);
@@ -454,11 +639,20 @@ impl App {
                 }
             });
             match s.phase {
+                Phase::Preparing if s.kind == JobKind::Verify => {
+                    ui.label(format!(
+                        "{} new files found so far",
+                        group_digits(s.verify.new)
+                    ));
+                }
                 Phase::Preparing => {
                     ui.label(format!(
                         "{} files found so far",
                         group_digits(s.files_total)
                     ));
+                }
+                Phase::Writing => {
+                    ui.spinner();
                 }
                 Phase::Removing => {
                     if s.files_total > 0 {
@@ -504,6 +698,27 @@ impl App {
                             format_duration(eta)
                         },
                     ));
+                    if s.kind == JobKind::Verify {
+                        ui.horizontal_wrapped(|ui| {
+                            let c = &s.verify;
+                            for (n, name, color) in [
+                                (c.ok, "OK", GREEN),
+                                (c.changed, "changed", AMBER),
+                                (c.possibly_corrupted, "POSSIBLY CORRUPTED", RED),
+                                (c.missing, "missing", ORANGE),
+                                (c.unreadable, "unreadable", ORANGE),
+                                (c.new, "new", BLUE),
+                                (c.unavailable, "on unavailable drives", ORANGE),
+                            ] {
+                                let text = format!("{} {name}", group_digits(n));
+                                if n > 0 {
+                                    ui.colored_label(color, egui::RichText::new(text).strong());
+                                } else {
+                                    ui.weak(text);
+                                }
+                            }
+                        });
+                    }
                 }
             }
             ui.add(
@@ -544,6 +759,180 @@ impl App {
 
     // ------------------------------------------------------------------ table
 
+    /// Result filter: one chip per classification, with counts.
+    fn chips(&mut self, ui: &mut egui::Ui) {
+        let mut want = None;
+        let mut toggle_run = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Show:");
+            let mut chip = |ui: &mut egui::Ui, show: Show, text: String, color: Option<egui::Color32>, hover: &str| {
+                let mut rich = egui::RichText::new(text);
+                if let Some(c) = color {
+                    rich = rich.color(c);
+                }
+                if ui.selectable_label(self.show == show, rich).on_hover_text(hover).clicked() {
+                    want = Some(show);
+                }
+            };
+            chip(ui, Show::All, format!("All ({})", group_digits(self.counts.total())), None, "Every entry.");
+            for (status, hover) in [
+                (Status::Ok, "Hash matches the stored one."),
+                (Status::Changed, "Content differs, and so does the size and/or modified time. Probably a normal edit; use Update if you made it."),
+                (Status::PossiblyCorrupted, "Content differs although size and modified time are unchanged. This is what bit rot looks like."),
+                (Status::Missing, "The file no longer exists."),
+                (Status::Unreadable, "The file could not be read. A read error on a file that used to be fine is a warning sign."),
+            ] {
+                let n = self.counts.get(status);
+                let color = (n > 0).then(|| status_color(status));
+                let mut text = format!("{} ({})", chip_name(status), group_digits(n));
+                if status == Status::PossiblyCorrupted && n > 0 {
+                    text = format!("⚠ {text}");
+                }
+                chip(ui, Show::Status(status), text, color, hover);
+            }
+            chip(
+                ui,
+                Show::New,
+                format!("New ({})", group_digits(self.new_count)),
+                (self.new_count > 0).then_some(BLUE),
+                "Files inside a tracked folder that are not in the database yet. Found by Verify.",
+            );
+            if self.last_run > 0 && self.show != Show::New {
+                ui.separator();
+                if ui
+                    .checkbox(&mut self.last_run_only, "Last verification only")
+                    .on_hover_text("Show only entries the most recent Verify looked at.")
+                    .changed()
+                {
+                    toggle_run = true;
+                }
+            }
+        });
+        if let Some(show) = want {
+            self.set_show(show);
+        } else if toggle_run {
+            self.anchor = None;
+            self.refresh();
+        }
+    }
+
+    /// Loud, persistent warnings and the summary of the last verification.
+    fn banners(&mut self, ui: &mut egui::Ui) {
+        if self.corrupted_total > 0 && !self.corrupted_banner_dismissed {
+            let mut show_them = false;
+            let mut dismiss = false;
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(150, 20, 20))
+                .inner_margin(8.0)
+                .corner_radius(4.0)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "⚠  {} POSSIBLY CORRUPTED",
+                                if self.corrupted_total == 1 {
+                                    "1 FILE IS".to_string()
+                                } else {
+                                    format!("{} FILES ARE", group_digits(self.corrupted_total))
+                                }
+                            ))
+                            .color(egui::Color32::WHITE)
+                            .strong()
+                            .size(16.0),
+                        );
+                        if ui.button("Show them").clicked() {
+                            show_them = true;
+                        }
+                        if ui.button("Dismiss").on_hover_text("Hide this banner. The files stay flagged.").clicked() {
+                            dismiss = true;
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "Their content changed although size and modified time did not. Check the drive's health \
+                             and restore these files from a backup. Do not use Update on them unless you are sure the \
+                             current content is right.",
+                        )
+                        .color(egui::Color32::WHITE),
+                    );
+                });
+            ui.add_space(4.0);
+            if show_them {
+                self.scope = Scope::All;
+                self.search.clear();
+                self.last_run_only = false;
+                self.show = Show::All; // force set_show to refresh
+                self.set_show(Show::Status(Status::PossiblyCorrupted));
+            }
+            if dismiss {
+                self.corrupted_banner_dismissed = true;
+            }
+        }
+
+        let mut close = false;
+        if let Some(v) = &self.verify_summary {
+            egui::Frame::new()
+                .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                .inner_margin(8.0)
+                .corner_radius(4.0)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(if v.cancelled {
+                            "Verification cancelled. Checked so far:"
+                        } else {
+                            "Verification finished:"
+                        });
+                        let c = &v.counts;
+                        for (n, name, color) in [
+                            (c.ok, "OK", GREEN),
+                            (c.changed, "changed", AMBER),
+                            (c.possibly_corrupted, "possibly corrupted", RED),
+                            (c.missing, "missing", ORANGE),
+                            (c.unreadable, "unreadable", ORANGE),
+                            (c.new, "new", BLUE),
+                        ] {
+                            let text = format!("{} {name}", group_digits(n));
+                            if n > 0 {
+                                ui.colored_label(color, egui::RichText::new(text).strong());
+                            } else {
+                                ui.weak(text);
+                            }
+                        }
+                        if ui.button("Export report…").clicked() {
+                            self.export = Some(ExportDialog { format: Format::Csv });
+                        }
+                        if ui.button("✖").on_hover_text("Close this summary").clicked() {
+                            close = true;
+                        }
+                    });
+                    for (volume, n) in &v.unavailable {
+                        ui.colored_label(
+                            ORANGE,
+                            format!(
+                                "Drive {volume} is not available: {} not checked (they are not marked missing).",
+                                entries_word(*n)
+                            ),
+                        );
+                    }
+                    if v.changed_during > 0 {
+                        ui.colored_label(
+                            AMBER,
+                            format!(
+                                "{} changed while being read and could not be judged; see the problems list.",
+                                entries_word(v.changed_during)
+                            ),
+                        );
+                    }
+                });
+            ui.add_space(4.0);
+        }
+        if close {
+            self.verify_summary = None;
+        }
+    }
+
     fn filter_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("Search:");
@@ -581,10 +970,144 @@ impl App {
                 self.selected.clear();
                 self.anchor = None;
             }
+            if self.show == Show::New {
+                ui.separator();
+                let idle = self.job.is_none();
+                let (label, ids) = if self.selected.is_empty() {
+                    (
+                        format!(
+                            "Add all {} to database",
+                            group_digits(self.ids.len() as u64)
+                        ),
+                        self.ids.clone(),
+                    )
+                } else {
+                    (
+                        format!(
+                            "Add {} selected to database",
+                            group_digits(self.selected.len() as u64)
+                        ),
+                        self.selected_ids(),
+                    )
+                };
+                if ui
+                    .add_enabled(idle && !ids.is_empty(), egui::Button::new(label))
+                    .on_hover_text(format!(
+                        "Hash these files with {} and start tracking them.",
+                        self.algo.name()
+                    ))
+                    .clicked()
+                {
+                    let job = Job::AddNew {
+                        new_file_ids: ids,
+                        algo: self.algo,
+                    };
+                    self.start_job(ui.ctx(), job);
+                }
+            }
         });
     }
 
+    /// The "New" view: untracked files found under roots.
+    fn new_table(&mut self, ui: &mut egui::Ui) {
+        if self.ids.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.weak(
+                    "No untracked files are known here. Verify looks for them in tracked folders.",
+                );
+            });
+            return;
+        }
+        if self.new_cache.len() > CACHE_LIMIT {
+            self.new_cache.clear();
+        }
+        let (ids, cache, db, selected) = (&self.ids, &mut self.new_cache, &self.db, &self.selected);
+        let mut db_error = None;
+        let mut clicked: Option<(usize, egui::Modifiers)> = None;
+        egui::ScrollArea::horizontal()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(true)
+                    .sense(egui::Sense::click())
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::initial(60.0).at_least(40.0).clip(true))
+                    .column(Column::initial(320.0).at_least(60.0).clip(true))
+                    .column(Column::initial(360.0).at_least(60.0).clip(true))
+                    .column(Column::initial(90.0).at_least(40.0).clip(true))
+                    .column(Column::initial(150.0).at_least(40.0).clip(true))
+                    .column(Column::remainder().at_least(150.0).clip(true))
+                    .header(22.0, |mut h| {
+                        for title in ["Status", "Name", "Folder", "Size", "Modified", "Found"] {
+                            h.col(|ui| {
+                                ui.strong(title);
+                            });
+                        }
+                    })
+                    .body(|body| {
+                        body.rows(ROW_HEIGHT, ids.len(), |mut row| {
+                            let index = row.index();
+                            let id = ids[index];
+                            if let std::collections::hash_map::Entry::Vacant(slot) = cache.entry(id)
+                            {
+                                match db.new_file(id) {
+                                    Ok(Some(n)) => {
+                                        slot.insert(n);
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => db_error = Some(e.to_string()),
+                                }
+                            }
+                            let Some(n) = cache.get(&id) else {
+                                row.col(|ui| {
+                                    ui.weak("…");
+                                });
+                                return;
+                            };
+                            row.set_selected(selected.contains(&id));
+                            let (folder, name) = split_path(&n.path);
+                            row.col(|ui| {
+                                ui.colored_label(BLUE, "New");
+                            });
+                            row.col(|ui| cell(ui, egui::RichText::new(name), &n.path));
+                            row.col(|ui| cell(ui, egui::RichText::new(folder), &n.path));
+                            row.col(|ui| {
+                                let exact = format!("{} bytes", group_digits(n.size));
+                                cell(ui, egui::RichText::new(human_bytes(n.size)), &exact);
+                            });
+                            row.col(|ui| {
+                                ui.label(format_unix_nanos(n.mtime_ns));
+                            });
+                            row.col(|ui| {
+                                ui.label(format_unix_secs(n.found_at));
+                            });
+                            let resp = row.response();
+                            if resp.clicked() {
+                                clicked = Some((index, resp.ctx.input(|i| i.modifiers)));
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button("Copy full path").clicked() {
+                                    ui.ctx().copy_text(n.path.clone());
+                                    ui.close();
+                                }
+                            });
+                        });
+                    });
+            });
+        if let Some(e) = db_error {
+            self.error = Some(e);
+        }
+        if let Some((index, mods)) = clicked {
+            self.click_row(index, mods);
+        }
+    }
+
     fn table(&mut self, ui: &mut egui::Ui) {
+        if self.show == Show::New {
+            self.new_table(ui);
+            return;
+        }
         if self.ids.is_empty() {
             ui.centered_and_justified(|ui| {
                 if self.total_count == 0 {
@@ -619,6 +1142,7 @@ impl App {
                     .column(Column::initial(140.0).at_least(40.0).clip(true))
                     .column(Column::initial(75.0).at_least(40.0).clip(true))
                     .column(Column::initial(140.0).at_least(40.0).clip(true))
+                    .column(Column::initial(150.0).at_least(40.0).clip(true))
                     .column(Column::remainder().at_least(150.0).clip(true))
                     .header(22.0, |mut h| {
                         for title in [
@@ -630,6 +1154,7 @@ impl App {
                             "Algorithm",
                             "Hash",
                             "Last verified",
+                            "Details",
                         ] {
                             h.col(|ui| {
                                 ui.strong(title);
@@ -687,6 +1212,11 @@ impl App {
                                     egui::RichText::new(format_unix_secs(e.last_verified)),
                                     &first,
                                 );
+                            });
+                            row.col(|ui| {
+                                if let Some(detail) = &e.last_error {
+                                    cell(ui, egui::RichText::new(detail), detail);
+                                }
                             });
                             let resp = row.response();
                             if resp.clicked() {
@@ -898,6 +1428,87 @@ impl App {
         self.show_about = open;
     }
 
+    fn export_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.export else {
+            return;
+        };
+        let run = self.last_run;
+        let mut dest: Option<ExportDest> = None;
+        let mut cancel = false;
+        let format = dialog.format;
+        let file_name = format!(
+            "hash-check-report-{}-run{run}.{}",
+            chrono::Local::now().format("%Y%m%d-%H%M%S"),
+            format.extension()
+        );
+        let reports_dir = self.appdir.reports_dir();
+        let modal = egui::Modal::new(egui::Id::unique("export")).show(ctx, |ui| {
+            ui.set_max_width(520.0);
+            ui.heading("Export the last verification report");
+            ui.add_space(6.0);
+            ui.label(
+                "The report lists every entry the last verification looked at, problems first, plus new files \
+                 and drives that were not available.",
+            );
+            ui.add_space(6.0);
+            for f in [Format::Csv, Format::Text] {
+                ui.radio_value(&mut dialog.format, f, f.label());
+            }
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+                if ui
+                    .button("Save in hash-check's folder")
+                    .on_hover_text(reports_dir.join(&file_name).display().to_string())
+                    .clicked()
+                {
+                    dest = Some(ExportDest::AppDir { file_name: file_name.clone() });
+                }
+                if ui
+                    .button("Choose location…")
+                    .on_hover_text("hash-check never overwrites a file: pick a name that does not exist yet.")
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .set_title("Save verification report")
+                        .set_file_name(&file_name)
+                        .add_filter(format.label(), &[format.extension()])
+                        .save_file()
+                {
+                    dest = Some(ExportDest::Chosen(path));
+                }
+            });
+        });
+        if let Some(dest) = dest {
+            self.export = None;
+            self.start_job(ctx, Job::Export { run, format, dest });
+        } else if cancel || modal.should_close() {
+            self.export = None;
+        }
+    }
+
+    fn info_window(&mut self, ctx: &egui::Context) {
+        let Some(msg) = self.info.clone() else { return };
+        egui::Window::new("Report")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(&msg);
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        self.info = None;
+                    }
+                    if ui.button("Copy path").clicked()
+                        && let Some(path) = msg.lines().nth(1)
+                    {
+                        ui.ctx().copy_text(path.to_string());
+                    }
+                });
+            });
+    }
+
     fn error_window(&mut self, ctx: &egui::Context) {
         let Some(msg) = self.error.clone() else {
             return;
@@ -912,6 +1523,16 @@ impl App {
                     self.error = None;
                 }
             });
+    }
+}
+
+fn chip_name(status: Status) -> &'static str {
+    match status {
+        Status::Ok => "OK",
+        Status::Changed => "Changed",
+        Status::PossiblyCorrupted => "Possibly corrupted",
+        Status::Missing => "Missing",
+        Status::Unreadable => "Unreadable",
     }
 }
 
@@ -944,6 +1565,15 @@ fn job_summary(s: &State) -> String {
             "{verdict}: {} removed from the database",
             entries_word(s.removed)
         ),
+        JobKind::Verify => format!(
+            "{verdict}: {} verified in {}",
+            entries_word(s.files_done),
+            format_duration(took)
+        ),
+        JobKind::Export => match &s.report_path {
+            Some(p) if s.fatal.is_none() => format!("Report saved: {}", p.display()),
+            _ => "Report not saved".to_string(),
+        },
     };
     if s.already_tracked > 0 {
         text += &format!(" · {} already tracked", group_digits(s.already_tracked));
@@ -998,7 +1628,7 @@ fn status_label(ui: &mut egui::Ui, e: &Entry) {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let dialog_open = self.confirm.is_some() || self.error.is_some();
+        let dialog_open = self.confirm.is_some() || self.error.is_some() || self.export.is_some();
 
         // Files dropped onto the window.
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -1040,12 +1670,16 @@ impl eframe::App for App {
                 self.roots_panel(ui);
             });
         egui::CentralPanel::default().show(ui, |ui| {
+            self.banners(ui);
+            self.chips(ui);
             self.filter_bar(ui);
             ui.separator();
             self.table(ui);
         });
 
         self.confirm_dialog(&ctx);
+        self.export_dialog(&ctx);
+        self.info_window(&ctx);
         self.problems_window(&ctx);
         self.about_window(&ctx);
         self.error_window(&ctx);
