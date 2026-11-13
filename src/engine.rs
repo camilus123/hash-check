@@ -5,12 +5,15 @@
 //! Results are committed in small batches, so a cancelled or crashed run
 //! keeps everything completed up to the last batch.
 
-use crate::db::{Db, DbResult, NewEntry};
+use crate::appdata::{AppDir, ReportWriter};
+use crate::db::{Db, DbResult, NewEntry, Scope, Status};
 use crate::fsread::{self, Kind, WalkItem};
 use crate::hasher::Algo;
 use crate::hashfile::{HashOutcome, hash_file};
+use crate::report::{self, Format};
 use crate::util::now_unix;
-use std::collections::HashSet;
+use crate::verify::{Fingerprint, Verdict, classify, volume_root};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,6 +45,36 @@ pub enum Job {
     RemoveEntries { ids: Vec<i64> },
     /// Forget a root and all its entries (never touching disk).
     RemoveRoot { root_id: i64 },
+    /// Compare files with their stored hashes and look for untracked files.
+    Verify { target: VerifyTarget },
+    /// Hash files that Verify found under a root and start tracking them.
+    AddNew { new_file_ids: Vec<i64>, algo: Algo },
+    /// Write the report of a verification run.
+    Export {
+        run: i64,
+        format: Format,
+        dest: ExportDest,
+    },
+}
+
+/// What a Verify job checks.
+#[derive(Clone, Debug)]
+pub enum VerifyTarget {
+    /// Every entry, plus a scan of every root for new files.
+    All,
+    /// The entries of one root, plus a scan of it for new files.
+    Root(i64),
+    /// Just these entries.
+    Entries(Vec<i64>),
+}
+
+/// Where a report goes.
+#[derive(Clone, Debug)]
+pub enum ExportDest {
+    /// `reports\<file name>` in the app's own folder.
+    AppDir { file_name: String },
+    /// A location the user picked. Must not exist yet.
+    Chosen(PathBuf),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -49,6 +82,22 @@ pub enum JobKind {
     Add,
     Update,
     Remove,
+    Verify,
+    Export,
+}
+
+/// Results of a Verify job so far.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VerifyCounts {
+    pub ok: u64,
+    pub changed: u64,
+    pub possibly_corrupted: u64,
+    pub missing: u64,
+    pub unreadable: u64,
+    /// Files under a scanned root that are not in the database.
+    pub new: u64,
+    /// Entries skipped because their drive is not connected.
+    pub unavailable: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -57,6 +106,8 @@ pub enum Phase {
     Preparing,
     Hashing,
     Removing,
+    /// Writing a report.
+    Writing,
     Finished,
 }
 
@@ -95,6 +146,14 @@ pub struct State {
     pub hashing_started: Option<Instant>,
     pub finished_at: Option<Instant>,
     pub paused: bool,
+    /// Verify: results so far.
+    pub verify: VerifyCounts,
+    /// Verify: id of this run.
+    pub run_id: i64,
+    /// Verify: drives that were not connected, with the number of entries skipped.
+    pub unavailable_volumes: Vec<(String, u64)>,
+    /// Export: where the report was written.
+    pub report_path: Option<PathBuf>,
     paused_since: Option<Instant>,
     paused_total: Duration,
 }
@@ -150,6 +209,10 @@ impl Shared {
                 hashing_started: None,
                 finished_at: None,
                 paused: false,
+                verify: VerifyCounts::default(),
+                run_id: 0,
+                unavailable_volumes: Vec::new(),
+                report_path: None,
                 paused_since: None,
                 paused_total: Duration::ZERO,
             }),
@@ -215,9 +278,11 @@ impl Shared {
 impl Job {
     pub fn kind(&self) -> JobKind {
         match self {
-            Job::Add { .. } => JobKind::Add,
             Job::Update { .. } => JobKind::Update,
             Job::RemoveEntries { .. } | Job::RemoveRoot { .. } => JobKind::Remove,
+            Job::Add { .. } | Job::AddNew { .. } => JobKind::Add,
+            Job::Verify { .. } => JobKind::Verify,
+            Job::Export { .. } => JobKind::Export,
         }
     }
 }
@@ -273,6 +338,9 @@ fn run(sh: &Shared, db_path: &Path, job: Job) {
             Job::Update { ids } => run_update(sh, &db, &ids),
             Job::RemoveEntries { ids } => run_remove_entries(sh, &db, &ids),
             Job::RemoveRoot { root_id } => run_remove_root(sh, &mut db, root_id),
+            Job::Verify { target } => run_verify(sh, &mut db, target),
+            Job::AddNew { new_file_ids, algo } => run_add_new(sh, &db, &new_file_ids, algo),
+            Job::Export { run, format, dest } => run_export(sh, &db, db_path, run, format, dest),
         });
     sh.with(|s| {
         if let Err(msg) = result {
@@ -287,6 +355,87 @@ fn run(sh: &Shared, db_path: &Path, job: Job) {
         s.paused = false;
         s.finished_at = Some(Instant::now());
     });
+}
+
+/// Batches database writes into short transactions.
+struct Batch<'a> {
+    db: &'a Db,
+    open: bool,
+    writes: usize,
+    started: Instant,
+}
+
+impl<'a> Batch<'a> {
+    fn new(db: &'a Db) -> Batch<'a> {
+        Batch {
+            db,
+            open: false,
+            writes: 0,
+            started: Instant::now(),
+        }
+    }
+
+    /// Wait out a pause (without holding the write lock), then make sure a
+    /// transaction is open. Returns `false` if the job was cancelled.
+    fn next(&mut self, sh: &Shared) -> Result<bool, String> {
+        if sh.is_paused() {
+            self.commit()?;
+        }
+        if !sh.checkpoint() {
+            return Ok(false);
+        }
+        if !self.open {
+            self.db.begin().map_err(|e| e.to_string())?;
+            self.open = true;
+            self.writes = 0;
+            self.started = Instant::now();
+        }
+        Ok(true)
+    }
+
+    /// Count a write and commit if the batch is full or old enough.
+    fn wrote(&mut self) -> Result<(), String> {
+        self.writes += 1;
+        if self.writes >= BATCH_FILES || self.started.elapsed() >= BATCH_TIME {
+            self.commit()?;
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self) -> Result<(), String> {
+        if self.open {
+            self.db.commit().map_err(|e| e.to_string())?;
+            self.open = false;
+        }
+        Ok(())
+    }
+}
+
+/// Hash one file with progress, pause and cancel, keeping the byte counter
+/// aligned with `planned_size` whatever happens.
+fn hash_one(
+    sh: &Shared,
+    buf: &mut Vec<u8>,
+    path: &Path,
+    algo: Algo,
+    planned_size: u64,
+) -> std::io::Result<HashOutcome> {
+    let mut read: u64 = 0;
+    let outcome = hash_file(path, algo, buf, true, &mut |n| {
+        read += n;
+        sh.bytes_done.fetch_add(n, Ordering::Relaxed);
+        sh.checkpoint()
+    });
+    if !matches!(outcome, Ok(HashOutcome::Cancelled)) {
+        if read < planned_size {
+            sh.bytes_done
+                .fetch_add(planned_size - read, Ordering::Relaxed);
+        } else if read > planned_size {
+            sh.bytes_done
+                .fetch_sub(read - planned_size, Ordering::Relaxed);
+        }
+    }
+    outcome
 }
 
 /// One file to hash.
@@ -314,41 +463,21 @@ fn hash_items(
         s.bytes_total = items.iter().map(|p| p.size).sum();
     });
     let mut buf = Vec::new();
-    let mut in_batch = 0usize;
-    let mut batch_started = Instant::now();
-    let mut open = false;
+    let mut batch = Batch::new(db);
     for p in items {
-        // Never sit paused while holding the database write lock.
-        if sh.is_paused() && open {
-            db.commit().map_err(|e| e.to_string())?;
-            open = false;
-            in_batch = 0;
-        }
-        if !sh.checkpoint() {
+        if !batch.next(sh)? {
             break;
-        }
-        if !open {
-            db.begin().map_err(|e| e.to_string())?;
-            open = true;
-            batch_started = Instant::now();
         }
         sh.with(|s| s.current.clone_from(&p.path));
         let path = Path::new(&p.path);
-        let mut read: u64 = 0;
-        let outcome = hash_file(path, p.algo, &mut buf, true, &mut |n| {
-            read += n;
-            sh.bytes_done.fetch_add(n, Ordering::Relaxed);
-            sh.checkpoint()
-        });
-        let mut stop = false;
-        match outcome {
+        match hash_one(sh, &mut buf, path, p.algo, p.size) {
             Ok(HashOutcome::Done {
                 hash,
                 size,
                 mtime_ns,
             }) => {
                 store(p, &hash, size, mtime_ns).map_err(|e| e.to_string())?;
-                in_batch += 1;
+                batch.wrote()?;
             }
             Ok(HashOutcome::ChangedDuringHash) => {
                 sh.with(|s| s.changed_during_hash += 1);
@@ -357,32 +486,13 @@ fn hash_items(
                     "changed while it was being hashed; result discarded, try again later".into(),
                 );
             }
-            Ok(HashOutcome::Cancelled) => stop = true,
+            Ok(HashOutcome::Cancelled) => break,
             Err(e) => sh.problem(path, e.to_string()),
         }
-        if stop {
-            break;
-        }
-        // Keep the byte counter aligned with the planned total even when a
-        // file was shorter, longer or unreadable.
-        if read < p.size {
-            sh.bytes_done.fetch_add(p.size - read, Ordering::Relaxed);
-        } else if read > p.size {
-            sh.bytes_done.fetch_sub(read - p.size, Ordering::Relaxed);
-        }
         sh.with(|s| s.files_done += 1);
-
-        if in_batch >= BATCH_FILES || (in_batch > 0 && batch_started.elapsed() >= BATCH_TIME) {
-            db.commit().map_err(|e| e.to_string())?;
-            open = false;
-            in_batch = 0;
-        }
     }
     // Cancelled or complete: keep everything hashed so far.
-    if open {
-        db.commit().map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    batch.commit()
 }
 
 fn run_add(
@@ -456,6 +566,387 @@ fn run_update(sh: &Shared, db: &Db, ids: &[i64]) -> Result<(), String> {
         }
         Ok(())
     })
+}
+
+/// Start tracking files that a verification found under a root.
+fn run_add_new(sh: &Shared, db: &Db, new_file_ids: &[i64], algo: Algo) -> Result<(), String> {
+    let mut items = Vec::with_capacity(new_file_ids.len());
+    for id in new_file_ids {
+        if !sh.checkpoint() {
+            return Ok(());
+        }
+        if let Some(n) = db.new_file(*id).map_err(|e| e.to_string())? {
+            items.push(Item {
+                id: None,
+                path: n.path,
+                size: n.size,
+                root_id: Some(n.root_id),
+                algo,
+            });
+        }
+    }
+    hash_items(sh, db, &items, &mut |p, hash, size, mtime_ns| {
+        // Storing the entry also takes the file off the "new" list.
+        let inserted = db.insert_entry(&NewEntry {
+            path: &p.path,
+            root_id: p.root_id,
+            size,
+            mtime_ns,
+            algo: p.algo,
+            hash,
+            now: now_unix(),
+        })?;
+        sh.with(|s| {
+            if inserted {
+                s.added += 1
+            } else {
+                s.already_tracked += 1
+            }
+        });
+        Ok(())
+    })
+}
+
+/// Remembers which volumes are reachable, asking the OS once per volume.
+struct Volumes {
+    available: HashMap<String, bool>,
+    skipped: Vec<(String, u64)>,
+}
+
+impl Volumes {
+    fn new() -> Volumes {
+        Volumes {
+            available: HashMap::new(),
+            skipped: Vec::new(),
+        }
+    }
+
+    /// Is the volume holding `path` reachable? Paths without a
+    /// recognisable volume count as reachable.
+    fn is_available(&mut self, path: &str) -> bool {
+        let Some(root) = volume_root(path) else {
+            return true;
+        };
+        if let Some(known) = self.available.get(root) {
+            return *known;
+        }
+        let ok = fsread::stat(Path::new(root)).is_ok();
+        self.available.insert(root.to_string(), ok);
+        ok
+    }
+
+    fn note_skipped(&mut self, path: &str, entries: u64) {
+        let root = volume_root(path).unwrap_or(path).to_string();
+        match self.skipped.iter_mut().find(|(v, _)| *v == root) {
+            Some((_, n)) => *n += entries,
+            None => self.skipped.push((root, entries)),
+        }
+    }
+}
+
+fn run_verify(sh: &Shared, db: &mut Db, target: VerifyTarget) -> Result<(), String> {
+    let e = |e: crate::db::DbError| e.to_string();
+    let run = db.begin_run().map_err(e)?;
+    sh.with(|s| s.run_id = run);
+    let db: &Db = db;
+
+    let (ids, bytes_total, roots, scope_text) = match &target {
+        VerifyTarget::All => (
+            db.all_ids().map_err(e)?,
+            db.total_size().map_err(e)?,
+            db.roots().map_err(e)?,
+            "everything".to_string(),
+        ),
+        VerifyTarget::Root(id) => {
+            let roots: Vec<_> = db
+                .roots()
+                .map_err(e)?
+                .into_iter()
+                .filter(|r| r.id == *id)
+                .collect();
+            let text = roots
+                .first()
+                .map(|r| format!("root {}", r.path))
+                .unwrap_or_else(|| "a removed root".into());
+            (
+                db.ids_filtered(Scope::Root(*id), "").map_err(e)?,
+                db.size_in_scope(Scope::Root(*id)).map_err(e)?,
+                roots,
+                text,
+            )
+        }
+        VerifyTarget::Entries(ids) => (
+            ids.clone(),
+            db.size_of(ids).map_err(e)?,
+            Vec::new(),
+            format!("{} selected entries", ids.len()),
+        ),
+    };
+    db.begin().map_err(e)?;
+    for (key, value) in [
+        (report::meta::RUN_OF_META, run.to_string()),
+        (report::meta::SCOPE, scope_text),
+        (report::meta::STARTED, now_unix().to_string()),
+        (report::meta::FINISHED, String::new()),
+        (report::meta::CANCELLED, "1".to_string()), // until it finishes properly
+        (report::meta::UNAVAILABLE, String::new()),
+    ] {
+        db.set_meta(key, &value).map_err(e)?;
+    }
+    db.commit().map_err(e)?;
+
+    let mut volumes = Volumes::new();
+    let mut batch = Batch::new(db);
+
+    // 1. Look for files under the roots that are not tracked yet.
+    for root in &roots {
+        if !batch.next(sh)? {
+            break;
+        }
+        sh.with(|s| s.current.clone_from(&root.path));
+        if fsread::stat(Path::new(&root.path)).is_err() {
+            if !volumes.is_available(&root.path) {
+                // Offline drive: keep earlier findings, the entries below are skipped too.
+                continue;
+            }
+            sh.problem(
+                Path::new(&root.path),
+                "tracked folder no longer exists".into(),
+            );
+            db.clear_new_files(root.id).map_err(e)?;
+            batch.wrote()?;
+            continue;
+        }
+        db.clear_new_files(root.id).map_err(e)?;
+        let mut db_err = None;
+        let now = now_unix();
+        fsread::walk(Path::new(&root.path), root.recursive, &mut |item| {
+            match item {
+                WalkItem::File { path, meta } => match path.to_str() {
+                    Some(p) => {
+                        let res = db.file_exists(p).and_then(|known| {
+                            if !known {
+                                db.insert_new_file(p, root.id, meta.size, meta.mtime_ns, now)?;
+                                sh.with(|s| s.verify.new += 1);
+                            }
+                            Ok(())
+                        });
+                        if let Err(err) = res {
+                            db_err = Some(err.to_string());
+                        }
+                    }
+                    None => sh.problem(
+                        path,
+                        "file name is not valid Unicode; cannot be tracked".into(),
+                    ),
+                },
+                WalkItem::SkippedLink { .. } => sh.with(|s| s.skipped_links += 1),
+                WalkItem::Error { path, error } => sh.problem(path, error.to_string()),
+            }
+            db_err.is_none() && !sh.cancelled()
+        });
+        if let Some(err) = db_err {
+            return Err(err);
+        }
+        batch.wrote()?;
+    }
+    batch.commit()?;
+
+    // 2. Re-hash every entry and compare.
+    sh.with(|s| {
+        s.phase = Phase::Hashing;
+        s.hashing_started = Some(Instant::now());
+        s.files_total = ids.len() as u64;
+        s.bytes_total = bytes_total;
+    });
+    let mut buf = Vec::new();
+    let mut completed = true;
+    for id in &ids {
+        if !batch.next(sh)? {
+            completed = false;
+            break;
+        }
+        // Entries removed in the meantime are simply skipped.
+        let Some(entry) = db.entry(*id).map_err(e)? else {
+            sh.with(|s| s.files_done += 1);
+            continue;
+        };
+        sh.with(|s| s.current.clone_from(&entry.path));
+        let path = Path::new(&entry.path);
+        let skip_bytes = || {
+            sh.bytes_done.fetch_add(entry.size, Ordering::Relaxed);
+        };
+
+        // (status, detail) to record, or None to leave the entry untouched.
+        let mut finding: Option<(Status, String)> = None;
+        let mut ok: Option<(u64, i64)> = None;
+        match fsread::stat(path) {
+            Err(err) => {
+                skip_bytes();
+                if !volumes.is_available(&entry.path) {
+                    volumes.note_skipped(&entry.path, 1);
+                    sh.with(|s| s.verify.unavailable += 1);
+                } else if err.kind() == std::io::ErrorKind::NotFound {
+                    finding = Some((Status::Missing, "the file no longer exists".into()));
+                } else {
+                    finding = Some((Status::Unreadable, err.to_string()));
+                }
+            }
+            Ok(meta) if meta.kind != Kind::File => {
+                skip_bytes();
+                finding = Some((
+                    Status::Unreadable,
+                    "this is no longer a regular file".into(),
+                ));
+            }
+            Ok(_) => match hash_one(sh, &mut buf, path, entry.algo, entry.size) {
+                Ok(HashOutcome::Done {
+                    hash,
+                    size,
+                    mtime_ns,
+                }) => {
+                    let stored = Fingerprint {
+                        hash: &entry.hash,
+                        size: entry.size,
+                        mtime_ns: entry.mtime_ns,
+                    };
+                    let current = Fingerprint {
+                        hash: &hash,
+                        size,
+                        mtime_ns,
+                    };
+                    match classify(stored, current) {
+                        Verdict::Ok => ok = Some((size, mtime_ns)),
+                        Verdict::Changed {
+                            size_differs,
+                            mtime_differs,
+                        } => {
+                            let mut what = Vec::new();
+                            if size_differs {
+                                what.push(format!("size {} -> {} bytes", entry.size, size));
+                            }
+                            if mtime_differs {
+                                what.push(format!(
+                                    "modified {} -> {}",
+                                    crate::util::format_unix_nanos(entry.mtime_ns),
+                                    crate::util::format_unix_nanos(mtime_ns)
+                                ));
+                            }
+                            finding = Some((
+                                Status::Changed,
+                                format!("content differs; {}", what.join(", ")),
+                            ));
+                        }
+                        Verdict::PossiblyCorrupted => {
+                            finding = Some((
+                                Status::PossiblyCorrupted,
+                                format!(
+                                    "content differs although size and modified time are unchanged; current {} {}",
+                                    entry.algo.name(),
+                                    crate::hasher::to_hex(&hash)
+                                ),
+                            ));
+                        }
+                    }
+                }
+                Ok(HashOutcome::ChangedDuringHash) => {
+                    sh.with(|s| s.changed_during_hash += 1);
+                    sh.problem(
+                        path,
+                        "changed while it was being verified; result discarded, verify it again later".into(),
+                    );
+                }
+                Ok(HashOutcome::Cancelled) => {
+                    completed = false;
+                    break;
+                }
+                // The file was there a moment ago: a read error on a file
+                // that used to be fine is itself a warning sign.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    finding = Some((Status::Missing, "the file no longer exists".into()));
+                }
+                Err(err) => finding = Some((Status::Unreadable, err.to_string())),
+            },
+        }
+
+        let now = now_unix();
+        if let Some((size, mtime_ns)) = ok {
+            db.record_verified_ok(entry.id, size, mtime_ns, now, run)
+                .map_err(e)?;
+            sh.with(|s| s.verify.ok += 1);
+            batch.wrote()?;
+        } else if let Some((status, detail)) = finding {
+            db.record_verified_problem(entry.id, status, &detail, now, run)
+                .map_err(e)?;
+            sh.with(|s| match status {
+                Status::Changed => s.verify.changed += 1,
+                Status::PossiblyCorrupted => s.verify.possibly_corrupted += 1,
+                Status::Missing => s.verify.missing += 1,
+                Status::Unreadable => s.verify.unreadable += 1,
+                Status::Ok => {}
+            });
+            batch.wrote()?;
+        }
+        sh.with(|s| s.files_done += 1);
+    }
+    batch.commit()?;
+
+    let unavailable: String = volumes
+        .skipped
+        .iter()
+        .map(|(v, n)| format!("{v}\t{n}\n"))
+        .collect();
+    sh.with(|s| s.unavailable_volumes.clone_from(&volumes.skipped));
+    db.begin().map_err(e)?;
+    db.set_meta(report::meta::FINISHED, &now_unix().to_string())
+        .map_err(e)?;
+    db.set_meta(
+        report::meta::CANCELLED,
+        if completed && !sh.cancelled() {
+            "0"
+        } else {
+            "1"
+        },
+    )
+    .map_err(e)?;
+    db.set_meta(report::meta::UNAVAILABLE, &unavailable)
+        .map_err(e)?;
+    db.commit().map_err(e)?;
+    Ok(())
+}
+
+fn run_export(
+    sh: &Shared,
+    db: &Db,
+    db_path: &Path,
+    run: i64,
+    format: Format,
+    dest: ExportDest,
+) -> Result<(), String> {
+    sh.with(|s| s.phase = Phase::Writing);
+    let (path, mut file) = match dest {
+        ExportDest::AppDir { file_name } => {
+            let dir = db_path
+                .parent()
+                .ok_or("the database has no parent folder")?;
+            AppDir::at(dir)
+                .create_report(&file_name)
+                .map_err(|e| e.to_string())?
+        }
+        ExportDest::Chosen(path) => {
+            let file =
+                ReportWriter::start(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            (path, file)
+        }
+    };
+    sh.with(|s| s.current = path.display().to_string());
+    let rows = report::write_report(db, run, format, &mut file).map_err(|e| e.to_string())?;
+    file.finish().map_err(|e| e.to_string())?;
+    sh.with(|s| {
+        s.files_done = rows;
+        s.report_path = Some(path);
+    });
+    Ok(())
 }
 
 fn run_remove_entries(sh: &Shared, db: &Db, ids: &[i64]) -> Result<(), String> {
