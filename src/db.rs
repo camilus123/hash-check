@@ -147,6 +147,18 @@ pub struct Root {
     pub added_at: i64,
 }
 
+/// Which entries a list shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    All,
+    Root(i64),
+    /// Files added individually, not through a folder.
+    Loose,
+}
+
+/// Bound parameters per statement when working through long id lists.
+const ID_CHUNK: usize = 500;
+
 pub struct Db {
     conn: Connection,
     /// Set when opening had to migrate an existing database.
@@ -332,6 +344,123 @@ impl Db {
             last_error,
         }))
     }
+
+    /// Ids in path order, limited to `scope` and to paths containing
+    /// `search` (case-insensitive for ASCII letters).
+    pub fn ids_filtered(&self, scope: Scope, search: &str) -> DbResult<Vec<i64>> {
+        let mut sql = String::from("SELECT id FROM files WHERE 1");
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        match scope {
+            Scope::All => {}
+            Scope::Root(id) => {
+                sql += " AND root_id = ?";
+                args.push(id.into());
+            }
+            Scope::Loose => sql += " AND root_id IS NULL",
+        }
+        if !search.is_empty() {
+            let mut pat = String::with_capacity(search.len() + 2);
+            pat.push('%');
+            for c in search.chars() {
+                if matches!(c, '%' | '_' | '\\') {
+                    pat.push('\\');
+                }
+                pat.push(c);
+            }
+            pat.push('%');
+            sql += " AND path LIKE ? ESCAPE '\\'";
+            args.push(pat.into());
+        }
+        sql += " ORDER BY path";
+        let mut st = self.conn.prepare(&sql)?;
+        let rows = st.query_map(rusqlite::params_from_iter(args), |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Number of entries per root, and the number of loose entries.
+    pub fn root_counts(&self) -> DbResult<(std::collections::HashMap<i64, u64>, u64)> {
+        let mut st = self.conn.prepare_cached("SELECT root_id, COUNT(*) FROM files GROUP BY root_id")?;
+        let mut per_root = std::collections::HashMap::new();
+        let mut loose = 0u64;
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            let n = r.get::<_, i64>(1)? as u64;
+            match r.get::<_, Option<i64>>(0)? {
+                Some(id) => {
+                    per_root.insert(id, n);
+                }
+                None => loose = n,
+            }
+        }
+        Ok((per_root, loose))
+    }
+
+    /// Delete database entries (never files). Call inside a transaction
+    /// for long lists. Returns how many rows were removed.
+    pub fn delete_entries(&self, ids: &[i64]) -> DbResult<u64> {
+        let mut removed = 0u64;
+        for chunk in ids.chunks(ID_CHUNK) {
+            let sql = format!("DELETE FROM files WHERE id IN ({})", placeholders(chunk.len()));
+            removed += self.conn.execute(&sql, rusqlite::params_from_iter(chunk))? as u64;
+        }
+        Ok(removed)
+    }
+
+    /// Forget a root and every entry that belongs to it, atomically.
+    /// Nothing on disk is touched. Returns the number of entries removed.
+    pub fn delete_root(&mut self, root_id: i64) -> DbResult<u64> {
+        let tx = self.conn.transaction()?;
+        let n = tx.execute("DELETE FROM files WHERE root_id = ?1", params![root_id])? as u64;
+        tx.execute("DELETE FROM roots WHERE id = ?1", params![root_id])?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// "Update": replace the stored hash of an entry with a fresh one. The
+    /// entry keeps its algorithm and its first-hashed time, and becomes OK.
+    pub fn replace_hash(&self, id: i64, size: u64, mtime_ns: i64, hash: &[u8], now: i64) -> DbResult<bool> {
+        let size = i64::try_from(size).map_err(|_| DbError::BadData("file size too large".into()))?;
+        let mut st = self.conn.prepare_cached(
+            "UPDATE files SET size = ?2, mtime_ns = ?3, hash = ?4, last_verified = ?5,
+                              last_result = ?6, last_error = NULL
+             WHERE id = ?1",
+        )?;
+        Ok(st.execute(params![id, size, mtime_ns, hash, now, Status::Ok.id()])? == 1)
+    }
+
+    /// Store the outcome of a verification. The stored hash is not changed.
+    pub fn record_result(&self, id: i64, status: Status, error: Option<&str>, now: i64) -> DbResult<bool> {
+        let mut st = self.conn.prepare_cached(
+            "UPDATE files SET last_result = ?2, last_error = ?3, last_verified = ?4 WHERE id = ?1",
+        )?;
+        Ok(st.execute(params![id, status.id(), error, now])? == 1)
+    }
+
+    /// How many of `ids` currently have `status` as their last result.
+    pub fn count_with_status(&self, ids: &[i64], status: Status) -> DbResult<u64> {
+        let mut total = 0u64;
+        for chunk in ids.chunks(ID_CHUNK) {
+            let sql = format!(
+                "SELECT COUNT(*) FROM files WHERE last_result = {} AND id IN ({})",
+                status.id(),
+                placeholders(chunk.len())
+            );
+            let n: i64 = self.conn.query_row(&sql, rusqlite::params_from_iter(chunk), |r| r.get(0))?;
+            total += n as u64;
+        }
+        Ok(total)
+    }
+}
+
+fn placeholders(n: usize) -> String {
+    let mut s = String::with_capacity(n * 2);
+    for i in 0..n {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('?');
+    }
+    s
 }
 
 /// Write a consistent copy of the database before changing its schema.
