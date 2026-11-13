@@ -3,7 +3,7 @@
 use hash_check::db::{Db, Status};
 use hash_check::engine::add_blocking;
 use hash_check::hasher::{Algo, hash_bytes};
-use hash_check::hashfile::{BUF_SIZE, HashOutcome, hash_file};
+use hash_check::hashfile::{BUF_SIZE, HashOpts, HashOutcome, ReadBuf, hash_file};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -197,22 +197,41 @@ fn file_changed_while_hashing_is_discarded() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("growing.bin");
     fs::write(&path, vec![1u8; BUF_SIZE * 2 + 10]).unwrap();
-    let mut buf = Vec::new();
+    let mut buf = ReadBuf::new();
     let mut appended = false;
-    let out = hash_file(&path, Algo::Blake3, &mut buf, true, &mut |_| {
-        if !appended {
-            // Another program appends while we are part-way through.
-            let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
-            f.write_all(b"more").unwrap();
-            appended = true;
-        }
-        true
-    })
+    let out = hash_file(
+        &path,
+        Algo::Blake3,
+        &mut buf,
+        HashOpts {
+            parallel: true,
+            direct: false,
+        },
+        &mut |_| {
+            if !appended {
+                // Another program appends while we are part-way through.
+                let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+                f.write_all(b"more").unwrap();
+                appended = true;
+            }
+            true
+        },
+    )
     .unwrap();
     assert_eq!(out, HashOutcome::ChangedDuringHash);
 
     // Untouched during hashing: a normal result.
-    let out = hash_file(&path, Algo::Blake3, &mut buf, true, &mut |_| true).unwrap();
+    let out = hash_file(
+        &path,
+        Algo::Blake3,
+        &mut buf,
+        HashOpts {
+            parallel: true,
+            direct: false,
+        },
+        &mut |_| true,
+    )
+    .unwrap();
     assert!(matches!(out, HashOutcome::Done { size, .. } if size == (BUF_SIZE * 2 + 14) as u64));
 }
 
@@ -221,12 +240,18 @@ fn hashing_can_be_cancelled_mid_file() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("big.bin");
     fs::write(&path, vec![9u8; BUF_SIZE * 3]).unwrap();
-    let mut buf = Vec::new();
+    let mut buf = ReadBuf::new();
     let mut blocks = 0;
-    let out = hash_file(&path, Algo::Sha256, &mut buf, false, &mut |_| {
-        blocks += 1;
-        false
-    })
+    let out = hash_file(
+        &path,
+        Algo::Sha256,
+        &mut buf,
+        HashOpts::default(),
+        &mut |_| {
+            blocks += 1;
+            false
+        },
+    )
     .unwrap();
     assert_eq!(out, HashOutcome::Cancelled);
     assert_eq!(blocks, 1, "must stop after the first block");

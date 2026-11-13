@@ -104,6 +104,18 @@ pub struct ReadOnlyFile {
 /// delete access, so hash-check never blocks another program from using
 /// the file, and it hints the cache manager that reads are sequential.
 pub fn open(path: &Path) -> io::Result<ReadOnlyFile> {
+    open_impl(path, false)
+}
+
+/// Like [`open`], but reads bypass the operating system's file cache, so
+/// every byte really comes from the drive. The caller must read into a
+/// 4096-byte-aligned buffer in multiples of 4096 bytes. Fails on file
+/// systems without direct I/O; callers fall back to [`open`].
+pub fn open_direct(path: &Path) -> io::Result<ReadOnlyFile> {
+    open_impl(path, true)
+}
+
+fn open_impl(path: &Path, direct: bool) -> io::Result<ReadOnlyFile> {
     let mut o = fs::OpenOptions::new();
     o.read(true);
     #[cfg(windows)]
@@ -113,8 +125,31 @@ pub fn open(path: &Path) -> io::Result<ReadOnlyFile> {
         const FILE_SHARE_WRITE: u32 = 0x2;
         const FILE_SHARE_DELETE: u32 = 0x4;
         const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+        const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
         o.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
-        o.custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
+        o.custom_flags(if direct {
+            FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_NO_BUFFERING
+        } else {
+            FILE_FLAG_SEQUENTIAL_SCAN
+        });
+    }
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_DIRECT: i32 = 0o40000;
+        if direct {
+            o.custom_flags(O_DIRECT);
+        }
+    }
+    #[cfg(not(any(
+        windows,
+        all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86"))
+    )))]
+    if direct {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "direct I/O is not available here",
+        ));
     }
     Ok(ReadOnlyFile { f: o.open(path)? })
 }

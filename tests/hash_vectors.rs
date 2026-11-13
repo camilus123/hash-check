@@ -6,7 +6,7 @@
 //! `blake3` bindings), so a bug shared by our code paths cannot hide.
 
 use hash_check::hasher::{Algo, Hasher, hash_bytes, to_hex};
-use hash_check::hashfile::{BUF_SIZE, HashOutcome, hash_file};
+use hash_check::hashfile::{BUF_SIZE, HashOpts, HashOutcome, ReadBuf, hash_file};
 
 /// Deterministic test data: byte i is (i * 31 + 7) mod 251.
 fn pattern(n: usize) -> Vec<u8> {
@@ -150,20 +150,38 @@ fn parallel_update_matches_serial() {
 #[test]
 fn files_hash_to_reference_including_larger_than_buffer() {
     let dir = tempfile::tempdir().unwrap();
-    let mut buf = Vec::new();
+    let mut buf = ReadBuf::new();
+    assert!(
+        buf.is_aligned(),
+        "the read buffer must be aligned for direct I/O"
+    );
     for &(algo, _, n, expected) in VECTORS {
         let path = dir.path().join(format!("{}-{n}.bin", algo.id()));
         std::fs::write(&path, pattern(n)).unwrap();
-        for parallel in [false, true] {
+        // Buffered and direct (cache-bypassing) reads, with and without
+        // multithreaded hashing, must all give the same digest. Sizes that
+        // are not a multiple of the sector size exercise the direct-read tail.
+        for (parallel, direct) in [(false, false), (true, false), (false, true), (true, true)] {
             let mut seen = 0u64;
-            let out = hash_file(&path, algo, &mut buf, parallel, &mut |b| {
-                seen += b;
-                true
-            })
+            let out = hash_file(
+                &path,
+                algo,
+                &mut buf,
+                HashOpts { parallel, direct },
+                &mut |b| {
+                    seen += b;
+                    true
+                },
+            )
             .unwrap();
             match out {
                 HashOutcome::Done { hash, size, .. } => {
-                    assert_eq!(to_hex(&hash), expected, "{} file of {n} bytes", algo.name());
+                    assert_eq!(
+                        to_hex(&hash),
+                        expected,
+                        "{} file of {n} bytes (parallel {parallel}, direct {direct})",
+                        algo.name()
+                    );
                     assert_eq!(size, n as u64);
                     assert_eq!(seen, n as u64);
                 }
