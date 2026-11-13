@@ -21,15 +21,28 @@ fn fixture(n: usize, algo: Algo) -> Fixture {
     for dir in ["a", "b"] {
         fs::create_dir_all(data.join(dir)).unwrap();
         for i in 0..n {
-            fs::write(data.join(dir).join(format!("f{i:04}.bin")), format!("{dir}-{i}")).unwrap();
+            fs::write(
+                data.join(dir).join(format!("f{i:04}.bin")),
+                format!("{dir}-{i}"),
+            )
+            .unwrap();
         }
     }
     fs::write(data.join("loose.txt"), b"loose").unwrap();
     let db_path = tmp.path().join("t.db");
-    let st = add_blocking(&db_path, &[data.join("a"), data.join("b"), data.join("loose.txt")], true, algo);
+    let st = add_blocking(
+        &db_path,
+        &[data.join("a"), data.join("b"), data.join("loose.txt")],
+        true,
+        algo,
+    );
     assert_eq!(st.added as usize, 2 * n + 1);
     assert_eq!(st.kind, JobKind::Add);
-    Fixture { _tmp: tmp, data, db_path }
+    Fixture {
+        _tmp: tmp,
+        data,
+        db_path,
+    }
 }
 
 fn files_on_disk(dir: &Path) -> usize {
@@ -57,10 +70,22 @@ fn scopes_search_and_counts() {
     assert_eq!(loose, 1);
     assert!(roots.iter().all(|r| per_root[&r.id] == 5));
     assert_eq!(db.ids_filtered(Scope::All, "").unwrap().len(), 11);
-    assert_eq!(db.ids_filtered(Scope::Root(roots[0].id), "").unwrap().len(), 5);
+    assert_eq!(
+        db.ids_filtered(Scope::Root(roots[0].id), "").unwrap().len(),
+        5
+    );
     assert_eq!(db.ids_filtered(Scope::Loose, "").unwrap().len(), 1);
-    assert_eq!(db.ids_filtered(Scope::All, "F0003").unwrap().len(), 2, "search ignores ASCII case");
-    assert_eq!(db.ids_filtered(Scope::Root(roots[1].id), "f0003").unwrap().len(), 1);
+    assert_eq!(
+        db.ids_filtered(Scope::All, "F0003").unwrap().len(),
+        2,
+        "search ignores ASCII case"
+    );
+    assert_eq!(
+        db.ids_filtered(Scope::Root(roots[1].id), "f0003")
+            .unwrap()
+            .len(),
+        1
+    );
     // LIKE wildcards in the search text are taken literally.
     assert_eq!(db.ids_filtered(Scope::All, "%").unwrap().len(), 0);
     assert_eq!(db.ids_filtered(Scope::All, "f000_").unwrap().len(), 0);
@@ -75,15 +100,31 @@ fn remove_entries_only_touches_the_database() {
     assert_eq!(victims.len(), 2);
     drop(db);
 
-    let st = run_blocking(&fx.db_path, Job::RemoveEntries { ids: victims.clone() });
-    assert_eq!((st.kind, st.phase, st.removed), (JobKind::Remove, Phase::Finished, 2));
+    let st = run_blocking(
+        &fx.db_path,
+        Job::RemoveEntries {
+            ids: victims.clone(),
+        },
+    );
+    assert_eq!(
+        (st.kind, st.phase, st.removed),
+        (JobKind::Remove, Phase::Finished, 2)
+    );
     assert!(st.fatal.is_none());
 
     let db = Db::open(&fx.db_path).unwrap();
     assert_eq!(db.count_files().unwrap(), 11);
     assert!(victims.iter().all(|id| db.entry(*id).unwrap().is_none()));
-    assert_eq!(db.roots().unwrap().len(), 2, "roots stay when single entries are removed");
-    assert_eq!(files_on_disk(&fx.data), before, "Remove must not delete files");
+    assert_eq!(
+        db.roots().unwrap().len(),
+        2,
+        "roots stay when single entries are removed"
+    );
+    assert_eq!(
+        files_on_disk(&fx.data),
+        before,
+        "Remove must not delete files"
+    );
     assert!(fx.data.join("a").join("f0002.bin").exists());
     assert!(db.integrity_check().unwrap());
 
@@ -110,11 +151,20 @@ fn remove_root_forgets_its_entries_and_nothing_else() {
     assert_eq!(db.ids_filtered(Scope::Root(kept.id), "").unwrap().len(), 4);
     assert_eq!(db.ids_filtered(Scope::Loose, "").unwrap().len(), 1);
     assert_eq!(db.count_files().unwrap(), 5);
-    assert_eq!(files_on_disk(&fx.data), before, "removing a root must not delete files");
+    assert_eq!(
+        files_on_disk(&fx.data),
+        before,
+        "removing a root must not delete files"
+    );
     drop(db);
 
     // The folder can be added again afterwards.
-    let st = add_blocking(&fx.db_path, &[PathBuf::from(&gone.path)], true, Algo::Blake3);
+    let st = add_blocking(
+        &fx.db_path,
+        &[PathBuf::from(&gone.path)],
+        true,
+        Algo::Blake3,
+    );
     assert_eq!(st.added, 4);
 }
 
@@ -134,14 +184,22 @@ fn update_replaces_hash_and_keeps_algorithm() {
             .unwrap();
         let untouched_before = entry_for(&db, "loose.txt");
         // Pretend an earlier verification flagged it.
-        db.record_result(old.id, Status::PossiblyCorrupted, Some("hash mismatch"), 77).unwrap();
-        assert_eq!(db.count_with_status(&[old.id, untouched_before.id], Status::PossiblyCorrupted).unwrap(), 1);
+        db.record_result(old.id, Status::PossiblyCorrupted, Some("hash mismatch"), 77)
+            .unwrap();
+        assert_eq!(
+            db.count_with_status(&[old.id, untouched_before.id], Status::PossiblyCorrupted)
+                .unwrap(),
+            1
+        );
         drop(db);
 
         // The user edits the file, then asks for Update.
         fs::write(&target, b"edited on purpose, now longer").unwrap();
         let st = run_blocking(&fx.db_path, Job::Update { ids: vec![old.id] });
-        assert_eq!((st.kind, st.updated, st.problem_count), (JobKind::Update, 1, 0));
+        assert_eq!(
+            (st.kind, st.updated, st.problem_count),
+            (JobKind::Update, 1, 0)
+        );
 
         let db = Db::open(&fx.db_path).unwrap();
         let new = db.entry(old.id).unwrap().unwrap();
@@ -151,9 +209,19 @@ fn update_replaces_hash_and_keeps_algorithm() {
         assert_eq!(new.size, 29);
         assert_eq!(new.status, Status::Ok);
         assert_eq!(new.last_error, None);
-        assert_eq!(new.first_hashed, old.first_hashed, "first-hashed time is history, not rewritten");
-        assert_eq!((new.path.as_str(), new.root_id), (old.path.as_str(), old.root_id));
-        assert_eq!(entry_for(&db, "loose.txt"), untouched_before, "unselected entries are not updated");
+        assert_eq!(
+            new.first_hashed, old.first_hashed,
+            "first-hashed time is history, not rewritten"
+        );
+        assert_eq!(
+            (new.path.as_str(), new.root_id),
+            (old.path.as_str(), old.root_id)
+        );
+        assert_eq!(
+            entry_for(&db, "loose.txt"),
+            untouched_before,
+            "unselected entries are not updated"
+        );
         assert_eq!(fs::read(&target).unwrap(), b"edited on purpose, now longer");
     }
 }
@@ -168,12 +236,21 @@ fn update_of_a_missing_file_keeps_the_old_hash() {
     drop(db);
     fs::remove_file(&own_copy).unwrap();
 
-    let st = run_blocking(&fx.db_path, Job::Update { ids: vec![old.id, 987_654] });
+    let st = run_blocking(
+        &fx.db_path,
+        Job::Update {
+            ids: vec![old.id, 987_654],
+        },
+    );
     assert_eq!(st.updated, 0);
     assert_eq!(st.problem_count, 1, "{:?}", st.problems);
     assert!(st.fatal.is_none());
     let db = Db::open(&fx.db_path).unwrap();
-    assert_eq!(db.entry(old.id).unwrap().unwrap(), old, "a failed update must leave the entry as it was");
+    assert_eq!(
+        db.entry(old.id).unwrap().unwrap(),
+        old,
+        "a failed update must leave the entry as it was"
+    );
 }
 
 fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
@@ -192,12 +269,21 @@ fn pause_holds_the_job_and_resume_finishes_it() {
     // Start paused, so the test does not race the worker.
     let shared = Arc::new(Shared::new(JobKind::Update));
     shared.set_paused(true);
-    engine::start_on(shared.clone(), fx.db_path.clone(), Job::Update { ids: ids.clone() }, Box::new(|| {}));
+    engine::start_on(
+        shared.clone(),
+        fx.db_path.clone(),
+        Job::Update { ids: ids.clone() },
+        Box::new(|| {}),
+    );
     std::thread::sleep(Duration::from_millis(300));
     let s = shared.snapshot();
     assert!(s.paused);
     assert_ne!(s.phase, Phase::Finished);
-    assert_eq!((s.files_done, s.updated), (0, 0), "a paused job must not make progress");
+    assert_eq!(
+        (s.files_done, s.updated),
+        (0, 0),
+        "a paused job must not make progress"
+    );
 
     // While paused the database is not locked: another connection can write.
     let db = Db::open(&fx.db_path).unwrap();
@@ -207,7 +293,9 @@ fn pause_holds_the_job_and_resume_finishes_it() {
     drop(db);
 
     shared.set_paused(false);
-    wait_until("the resumed job to finish", || shared.snapshot().phase == Phase::Finished);
+    wait_until("the resumed job to finish", || {
+        shared.snapshot().phase == Phase::Finished
+    });
     let s = shared.snapshot();
     assert_eq!(s.updated as usize, ids.len());
     assert!(!s.cancelled && !s.paused);
@@ -229,19 +317,89 @@ fn cancel_works_while_paused_and_keeps_finished_work() {
     engine::start_on(
         shared.clone(),
         fx.db_path.clone(),
-        Job::Add { inputs: vec![extra.clone()], recursive: true, algo: Algo::Sha256 },
+        Job::Add {
+            inputs: vec![extra.clone()],
+            recursive: true,
+            algo: Algo::Sha256,
+        },
         Box::new(|| {}),
     );
     std::thread::sleep(Duration::from_millis(100));
     shared.request_cancel();
-    wait_until("the cancelled job to stop", || shared.snapshot().phase == Phase::Finished);
+    wait_until("the cancelled job to stop", || {
+        shared.snapshot().phase == Phase::Finished
+    });
     let s = shared.snapshot();
     assert!(s.cancelled);
     assert!(s.fatal.is_none());
 
     let db = Db::open(&fx.db_path).unwrap();
     let after = db.count_files().unwrap();
-    assert_eq!(after, before + s.added, "exactly the files reported as added are stored");
-    assert!(s.added < 200, "the job was cancelled before it could finish");
+    assert_eq!(
+        after,
+        before + s.added,
+        "exactly the files reported as added are stored"
+    );
+    assert!(
+        s.added < 200,
+        "the job was cancelled before it could finish"
+    );
     assert!(db.integrity_check().unwrap());
+}
+
+#[test]
+fn cancelled_add_leaves_no_empty_root_behind() {
+    let fx = fixture(3, Algo::Blake3);
+    let fresh = fx.data.join("fresh");
+    fs::create_dir_all(&fresh).unwrap();
+    for i in 0..50 {
+        fs::write(fresh.join(format!("n{i:02}")), format!("new {i}")).unwrap();
+    }
+    let start_cancelled = |inputs: Vec<PathBuf>| {
+        let shared = Arc::new(Shared::new(JobKind::Add));
+        shared.set_paused(true);
+        engine::start_on(
+            shared.clone(),
+            fx.db_path.clone(),
+            Job::Add {
+                inputs,
+                recursive: true,
+                algo: Algo::Blake3,
+            },
+            Box::new(|| {}),
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        shared.request_cancel();
+        wait_until("the cancelled job to stop", || {
+            shared.snapshot().phase == Phase::Finished
+        });
+        shared.snapshot()
+    };
+
+    // Stopped before anything was hashed: the new root must be gone again.
+    let s = start_cancelled(vec![fresh.clone()]);
+    assert_eq!(s.added, 0);
+    let db = Db::open(&fx.db_path).unwrap();
+    let roots = db.roots().unwrap();
+    assert_eq!(
+        roots.len(),
+        2,
+        "cancelled add left an empty root: {roots:?}"
+    );
+    drop(db);
+
+    // Cancelling an add of an already tracked root must not remove that root.
+    let s = start_cancelled(vec![fx.data.join("a")]);
+    assert_eq!(s.added, 0);
+    let db = Db::open(&fx.db_path).unwrap();
+    assert_eq!(db.roots().unwrap().len(), 2);
+    assert_eq!(db.count_files().unwrap(), 7);
+    drop(db);
+
+    // A completed add keeps its root, even for a folder with no files in it.
+    let empty = fx.data.join("empty-folder");
+    fs::create_dir_all(&empty).unwrap();
+    let st = add_blocking(&fx.db_path, &[empty, fresh], true, Algo::Blake3);
+    assert_eq!(st.added, 50);
+    assert_eq!(Db::open(&fx.db_path).unwrap().roots().unwrap().len(), 4);
 }

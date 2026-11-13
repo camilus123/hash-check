@@ -37,7 +37,9 @@ fn mtime_ns(t: io::Result<SystemTime>) -> i64 {
     match t {
         Ok(t) => match t.duration_since(UNIX_EPOCH) {
             Ok(d) => i64::try_from(d.as_nanos()).unwrap_or(i64::MAX),
-            Err(e) => i64::try_from(e.duration().as_nanos()).map(|n| -n).unwrap_or(i64::MIN),
+            Err(e) => i64::try_from(e.duration().as_nanos())
+                .map(|n| -n)
+                .unwrap_or(i64::MIN),
         },
         Err(_) => 0,
     }
@@ -54,7 +56,11 @@ fn meta_from(m: &fs::Metadata) -> FileMeta {
     } else {
         Kind::Other
     };
-    FileMeta { size: m.len(), mtime_ns: mtime_ns(m.modified()), kind }
+    FileMeta {
+        size: m.len(),
+        mtime_ns: mtime_ns(m.modified()),
+        kind,
+    }
 }
 
 /// Metadata of `path` itself; links are reported as links, not followed.
@@ -132,11 +138,19 @@ impl ReadOnlyFile {
 
 /// What [`walk`] reports.
 pub enum WalkItem<'a> {
-    File { path: &'a Path, meta: FileMeta },
+    File {
+        path: &'a Path,
+        meta: FileMeta,
+    },
     /// A link/junction that was not followed.
-    SkippedLink { path: &'a Path },
+    SkippedLink {
+        path: &'a Path,
+    },
     /// A directory or entry that could not be read.
-    Error { path: &'a Path, error: io::Error },
+    Error {
+        path: &'a Path,
+        error: io::Error,
+    },
 }
 
 /// List the regular files in `dir`, descending into subdirectories when

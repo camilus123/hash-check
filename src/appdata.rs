@@ -29,7 +29,9 @@ impl AppDir {
 
     /// Use an explicit directory (tests).
     pub fn at(dir: &Path) -> AppDir {
-        AppDir { dir: dir.to_path_buf() }
+        AppDir {
+            dir: dir.to_path_buf(),
+        }
     }
 
     pub fn dir(&self) -> &Path {
@@ -44,7 +46,9 @@ impl AppDir {
     /// file of our own. hash-check refuses to run otherwise, rather than
     /// quietly writing somewhere else.
     pub fn check_writable(&self) -> Result<(), String> {
-        let probe = self.dir.join(format!(".hash-check-write-test-{}", std::process::id()));
+        let probe = self
+            .dir
+            .join(format!(".hash-check-write-test-{}", std::process::id()));
         fs::write(&probe, b"hash-check write test")
             .and_then(|_| fs::remove_file(&probe))
             .map_err(|e| {

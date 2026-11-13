@@ -85,8 +85,13 @@ pub enum Status {
 }
 
 impl Status {
-    pub const ALL: [Status; 5] =
-        [Status::Ok, Status::Changed, Status::PossiblyCorrupted, Status::Missing, Status::Unreadable];
+    pub const ALL: [Status; 5] = [
+        Status::Ok,
+        Status::Changed,
+        Status::PossiblyCorrupted,
+        Status::Missing,
+        Status::Unreadable,
+    ];
 
     pub fn id(self) -> i64 {
         match self {
@@ -200,12 +205,16 @@ impl Db {
     }
 
     pub fn schema_version(&self) -> DbResult<i64> {
-        Ok(self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
+        Ok(self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?)
     }
 
     /// Full structural check of the database file.
     pub fn integrity_check(&self) -> DbResult<bool> {
-        let r: String = self.conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        let r: String = self
+            .conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
         Ok(r == "ok")
     }
 
@@ -228,17 +237,35 @@ impl Db {
 
     // ---- roots ----
 
-    /// Remember a directory root; returns its id (existing or new).
-    pub fn add_root(&self, path: &str, recursive: bool, now: i64) -> DbResult<i64> {
-        self.conn.execute(
+    /// Remember a directory root. Returns its id and whether this call
+    /// created it (`false` if it was already tracked).
+    pub fn add_root(&self, path: &str, recursive: bool, now: i64) -> DbResult<(i64, bool)> {
+        let created = self.conn.execute(
             "INSERT OR IGNORE INTO roots(path, recursive, added_at) VALUES (?1, ?2, ?3)",
             params![path, recursive, now],
-        )?;
+        )? == 1;
         // A root first added without subfolders becomes recursive if re-added as a tree.
-        if recursive {
-            self.conn.execute("UPDATE roots SET recursive = 1 WHERE path = ?1", params![path])?;
+        if recursive && !created {
+            self.conn.execute(
+                "UPDATE roots SET recursive = 1 WHERE path = ?1",
+                params![path],
+            )?;
         }
-        Ok(self.conn.query_row("SELECT id FROM roots WHERE path = ?1", params![path], |r| r.get(0))?)
+        let id =
+            self.conn
+                .query_row("SELECT id FROM roots WHERE path = ?1", params![path], |r| {
+                    r.get(0)
+                })?;
+        Ok((id, created))
+    }
+
+    /// Forget a root only if it has no entries. Returns whether it was removed.
+    pub fn delete_root_if_empty(&self, root_id: i64) -> DbResult<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM roots WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM files WHERE root_id = ?1)",
+            params![root_id],
+        )?;
+        Ok(n == 1)
     }
 
     pub fn roots(&self) -> DbResult<Vec<Root>> {
@@ -246,7 +273,12 @@ impl Db {
             .conn
             .prepare_cached("SELECT id, path, recursive, added_at FROM roots ORDER BY path")?;
         let rows = st.query_map([], |r| {
-            Ok(Root { id: r.get(0)?, path: r.get(1)?, recursive: r.get(2)?, added_at: r.get(3)? })
+            Ok(Root {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                recursive: r.get(2)?,
+                added_at: r.get(3)?,
+            })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -254,14 +286,20 @@ impl Db {
     // ---- files ----
 
     pub fn file_exists(&self, path: &str) -> DbResult<bool> {
-        let mut st = self.conn.prepare_cached("SELECT 1 FROM files WHERE path = ?1")?;
-        Ok(st.query_row(params![path], |_| Ok(())).optional()?.is_some())
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT 1 FROM files WHERE path = ?1")?;
+        Ok(st
+            .query_row(params![path], |_| Ok(()))
+            .optional()?
+            .is_some())
     }
 
     /// Insert a freshly hashed file. Returns `false` (and changes nothing)
     /// if the path is already tracked: adding never overwrites a stored hash.
     pub fn insert_entry(&self, e: &NewEntry<'_>) -> DbResult<bool> {
-        let size = i64::try_from(e.size).map_err(|_| DbError::BadData("file size too large".into()))?;
+        let size =
+            i64::try_from(e.size).map_err(|_| DbError::BadData("file size too large".into()))?;
         let mut st = self.conn.prepare_cached(
             "INSERT OR IGNORE INTO files
                  (path, root_id, size, mtime_ns, algo, hash, first_hashed, last_verified, last_result)
@@ -281,20 +319,25 @@ impl Db {
     }
 
     pub fn count_files(&self) -> DbResult<u64> {
-        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
         Ok(n as u64)
     }
 
     pub fn total_size(&self) -> DbResult<u64> {
-        let n: i64 =
-            self.conn.query_row("SELECT COALESCE(SUM(size), 0) FROM files", [], |r| r.get(0))?;
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COALESCE(SUM(size), 0) FROM files", [], |r| r.get(0))?;
         Ok(n as u64)
     }
 
     /// Ids of all entries in path order. Eight bytes per entry, so the UI
     /// can hold this for millions of files and load rows only when visible.
     pub fn all_ids(&self) -> DbResult<Vec<i64>> {
-        let mut st = self.conn.prepare_cached("SELECT id FROM files ORDER BY path")?;
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT id FROM files ORDER BY path")?;
         let rows = st.query_map([], |r| r.get(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -322,12 +365,25 @@ impl Db {
                 ))
             })
             .optional()?;
-        let Some((id, path, root_id, size, mtime_ns, algo, hash, first_hashed, last_verified, res, last_error)) = raw
+        let Some((
+            id,
+            path,
+            root_id,
+            size,
+            mtime_ns,
+            algo,
+            hash,
+            first_hashed,
+            last_verified,
+            res,
+            last_error,
+        )) = raw
         else {
             return Ok(None);
         };
-        let algo = Algo::from_id(algo)
-            .ok_or_else(|| DbError::BadData(format!("unknown hash algorithm id {algo} for {path}")))?;
+        let algo = Algo::from_id(algo).ok_or_else(|| {
+            DbError::BadData(format!("unknown hash algorithm id {algo} for {path}"))
+        })?;
         let status = Status::from_id(res)
             .ok_or_else(|| DbError::BadData(format!("unknown result id {res} for {path}")))?;
         Ok(Some(Entry {
@@ -379,7 +435,9 @@ impl Db {
 
     /// Number of entries per root, and the number of loose entries.
     pub fn root_counts(&self) -> DbResult<(std::collections::HashMap<i64, u64>, u64)> {
-        let mut st = self.conn.prepare_cached("SELECT root_id, COUNT(*) FROM files GROUP BY root_id")?;
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT root_id, COUNT(*) FROM files GROUP BY root_id")?;
         let mut per_root = std::collections::HashMap::new();
         let mut loose = 0u64;
         let mut rows = st.query([])?;
@@ -400,7 +458,10 @@ impl Db {
     pub fn delete_entries(&self, ids: &[i64]) -> DbResult<u64> {
         let mut removed = 0u64;
         for chunk in ids.chunks(ID_CHUNK) {
-            let sql = format!("DELETE FROM files WHERE id IN ({})", placeholders(chunk.len()));
+            let sql = format!(
+                "DELETE FROM files WHERE id IN ({})",
+                placeholders(chunk.len())
+            );
             removed += self.conn.execute(&sql, rusqlite::params_from_iter(chunk))? as u64;
         }
         Ok(removed)
@@ -418,8 +479,16 @@ impl Db {
 
     /// "Update": replace the stored hash of an entry with a fresh one. The
     /// entry keeps its algorithm and its first-hashed time, and becomes OK.
-    pub fn replace_hash(&self, id: i64, size: u64, mtime_ns: i64, hash: &[u8], now: i64) -> DbResult<bool> {
-        let size = i64::try_from(size).map_err(|_| DbError::BadData("file size too large".into()))?;
+    pub fn replace_hash(
+        &self,
+        id: i64,
+        size: u64,
+        mtime_ns: i64,
+        hash: &[u8],
+        now: i64,
+    ) -> DbResult<bool> {
+        let size =
+            i64::try_from(size).map_err(|_| DbError::BadData("file size too large".into()))?;
         let mut st = self.conn.prepare_cached(
             "UPDATE files SET size = ?2, mtime_ns = ?3, hash = ?4, last_verified = ?5,
                               last_result = ?6, last_error = NULL
@@ -429,7 +498,13 @@ impl Db {
     }
 
     /// Store the outcome of a verification. The stored hash is not changed.
-    pub fn record_result(&self, id: i64, status: Status, error: Option<&str>, now: i64) -> DbResult<bool> {
+    pub fn record_result(
+        &self,
+        id: i64,
+        status: Status,
+        error: Option<&str>,
+        now: i64,
+    ) -> DbResult<bool> {
         let mut st = self.conn.prepare_cached(
             "UPDATE files SET last_result = ?2, last_error = ?3, last_verified = ?4 WHERE id = ?1",
         )?;
@@ -445,7 +520,9 @@ impl Db {
                 status.id(),
                 placeholders(chunk.len())
             );
-            let n: i64 = self.conn.query_row(&sql, rusqlite::params_from_iter(chunk), |r| r.get(0))?;
+            let n: i64 = self
+                .conn
+                .query_row(&sql, rusqlite::params_from_iter(chunk), |r| r.get(0))?;
             total += n as u64;
         }
         Ok(total)
@@ -466,11 +543,19 @@ fn placeholders(n: usize) -> String {
 /// Write a consistent copy of the database before changing its schema.
 fn backup_before_migration(conn: &Connection, path: &Path, old_version: i64) -> DbResult<PathBuf> {
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "hash-check.db".into());
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "hash-check.db".into());
     let mut n = 0;
     let target = loop {
-        let suffix = if n == 0 { String::new() } else { format!("-{n}") };
-        let candidate = path.with_file_name(format!("{name}.backup-v{old_version}-{stamp}{suffix}"));
+        let suffix = if n == 0 {
+            String::new()
+        } else {
+            format!("-{n}")
+        };
+        let candidate =
+            path.with_file_name(format!("{name}.backup-v{old_version}-{stamp}{suffix}"));
         if !candidate.exists() {
             break candidate;
         }

@@ -31,7 +31,11 @@ const PAUSE_POLL: Duration = Duration::from_millis(25);
 #[derive(Clone, Debug)]
 pub enum Job {
     /// Hash new files and folders into the database.
-    Add { inputs: Vec<PathBuf>, recursive: bool, algo: Algo },
+    Add {
+        inputs: Vec<PathBuf>,
+        recursive: bool,
+        algo: Algo,
+    },
     /// Re-hash existing entries and replace their stored hashes.
     Update { ids: Vec<i64> },
     /// Delete entries from the database (never from disk).
@@ -98,13 +102,17 @@ pub struct State {
 impl State {
     /// Seconds spent hashing, not counting time spent paused.
     pub fn active_hashing_secs(&self) -> f64 {
-        let Some(start) = self.hashing_started else { return 0.0 };
+        let Some(start) = self.hashing_started else {
+            return 0.0;
+        };
         let end = self.finished_at.unwrap_or_else(Instant::now);
         let mut paused = self.paused_total;
         if let Some(since) = self.paused_since {
             paused += end.saturating_duration_since(since);
         }
-        end.saturating_duration_since(start).saturating_sub(paused).as_secs_f64()
+        end.saturating_duration_since(start)
+            .saturating_sub(paused)
+            .as_secs_f64()
     }
 }
 
@@ -195,7 +203,10 @@ impl Shared {
         self.with(|s| {
             s.problem_count += 1;
             if s.problems.len() < MAX_LISTED_PROBLEMS {
-                s.problems.push(Problem { path: path.display().to_string(), message });
+                s.problems.push(Problem {
+                    path: path.display().to_string(),
+                    message,
+                });
             }
         });
     }
@@ -240,16 +251,29 @@ pub fn run_blocking(db_path: &Path, job: Job) -> State {
 
 /// Convenience for tests: a blocking Add.
 pub fn add_blocking(db_path: &Path, inputs: &[PathBuf], recursive: bool, algo: Algo) -> State {
-    run_blocking(db_path, Job::Add { inputs: inputs.to_vec(), recursive, algo })
+    run_blocking(
+        db_path,
+        Job::Add {
+            inputs: inputs.to_vec(),
+            recursive,
+            algo,
+        },
+    )
 }
 
 fn run(sh: &Shared, db_path: &Path, job: Job) {
-    let result = Db::open(db_path).map_err(|e| e.to_string()).and_then(|mut db| match job {
-        Job::Add { inputs, recursive, algo } => run_add(sh, &db, &inputs, recursive, algo),
-        Job::Update { ids } => run_update(sh, &db, &ids),
-        Job::RemoveEntries { ids } => run_remove_entries(sh, &db, &ids),
-        Job::RemoveRoot { root_id } => run_remove_root(sh, &mut db, root_id),
-    });
+    let result = Db::open(db_path)
+        .map_err(|e| e.to_string())
+        .and_then(|mut db| match job {
+            Job::Add {
+                inputs,
+                recursive,
+                algo,
+            } => run_add(sh, &db, &inputs, recursive, algo),
+            Job::Update { ids } => run_update(sh, &db, &ids),
+            Job::RemoveEntries { ids } => run_remove_entries(sh, &db, &ids),
+            Job::RemoveRoot { root_id } => run_remove_root(sh, &mut db, root_id),
+        });
     sh.with(|s| {
         if let Err(msg) = result {
             s.fatal = Some(msg);
@@ -318,13 +342,20 @@ fn hash_items(
         });
         let mut stop = false;
         match outcome {
-            Ok(HashOutcome::Done { hash, size, mtime_ns }) => {
+            Ok(HashOutcome::Done {
+                hash,
+                size,
+                mtime_ns,
+            }) => {
                 store(p, &hash, size, mtime_ns).map_err(|e| e.to_string())?;
                 in_batch += 1;
             }
             Ok(HashOutcome::ChangedDuringHash) => {
                 sh.with(|s| s.changed_during_hash += 1);
-                sh.problem(path, "changed while it was being hashed; result discarded, try again later".into());
+                sh.problem(
+                    path,
+                    "changed while it was being hashed; result discarded, try again later".into(),
+                );
             }
             Ok(HashOutcome::Cancelled) => stop = true,
             Err(e) => sh.problem(path, e.to_string()),
@@ -354,24 +385,47 @@ fn hash_items(
     Ok(())
 }
 
-fn run_add(sh: &Shared, db: &Db, inputs: &[PathBuf], recursive: bool, algo: Algo) -> Result<(), String> {
-    let items = scan(sh, db, inputs, recursive, algo)?;
-    if sh.cancelled() {
-        return Ok(());
+fn run_add(
+    sh: &Shared,
+    db: &Db,
+    inputs: &[PathBuf],
+    recursive: bool,
+    algo: Algo,
+) -> Result<(), String> {
+    let mut new_roots = Vec::new();
+    let result = scan(sh, db, inputs, recursive, algo, &mut new_roots).and_then(|items| {
+        if sh.cancelled() {
+            return Ok(());
+        }
+        hash_items(sh, db, &items, &mut |p, hash, size, mtime_ns| {
+            let inserted = db.insert_entry(&NewEntry {
+                path: &p.path,
+                root_id: p.root_id,
+                size,
+                mtime_ns,
+                algo: p.algo,
+                hash,
+                now: now_unix(),
+            })?;
+            sh.with(|s| {
+                if inserted {
+                    s.added += 1
+                } else {
+                    s.already_tracked += 1
+                }
+            });
+            Ok(())
+        })
+    });
+    // A run that was stopped must not leave behind a root it created but
+    // never stored a file for. (A completed run keeps even an empty folder
+    // as a root, so files appearing in it later are noticed.)
+    if sh.cancelled() || result.is_err() {
+        for id in new_roots {
+            let _ = db.delete_root_if_empty(id);
+        }
     }
-    hash_items(sh, db, &items, &mut |p, hash, size, mtime_ns| {
-        let inserted = db.insert_entry(&NewEntry {
-            path: &p.path,
-            root_id: p.root_id,
-            size,
-            mtime_ns,
-            algo: p.algo,
-            hash,
-            now: now_unix(),
-        })?;
-        sh.with(|s| if inserted { s.added += 1 } else { s.already_tracked += 1 });
-        Ok(())
-    })
+    result
 }
 
 fn run_update(sh: &Shared, db: &Db, ids: &[i64]) -> Result<(), String> {
@@ -383,7 +437,13 @@ fn run_update(sh: &Shared, db: &Db, ids: &[i64]) -> Result<(), String> {
         // Entries removed in the meantime are simply skipped.
         if let Some(e) = db.entry(*id).map_err(|e| e.to_string())? {
             // Each entry keeps the algorithm it was created with.
-            items.push(Item { id: Some(e.id), path: e.path, size: e.size, root_id: e.root_id, algo: e.algo });
+            items.push(Item {
+                id: Some(e.id),
+                path: e.path,
+                size: e.size,
+                root_id: e.root_id,
+                algo: e.algo,
+            });
         }
         if i % 1000 == 0 {
             sh.with(|s| s.files_total = items.len() as u64);
@@ -444,7 +504,10 @@ struct Scanner<'a> {
 impl Scanner<'_> {
     fn consider(&mut self, path: &Path, size: u64, root_id: Option<i64>) {
         let Some(s) = path.to_str() else {
-            self.sh.problem(path, "file name is not valid Unicode; cannot be tracked".into());
+            self.sh.problem(
+                path,
+                "file name is not valid Unicode; cannot be tracked".into(),
+            );
             return;
         };
         if self.seen.contains(s) {
@@ -454,7 +517,13 @@ impl Scanner<'_> {
             Ok(true) => self.sh.with(|st| st.already_tracked += 1),
             Ok(false) => {
                 self.seen.insert(s.to_string());
-                self.items.push(Item { id: None, path: s.to_string(), size, root_id, algo: self.algo });
+                self.items.push(Item {
+                    id: None,
+                    path: s.to_string(),
+                    size,
+                    root_id,
+                    algo: self.algo,
+                });
             }
             Err(e) => self.db_err = Some(e.to_string()),
         }
@@ -467,7 +536,15 @@ impl Scanner<'_> {
 }
 
 /// Enumerate the files to hash, registering directory roots on the way.
-fn scan(sh: &Shared, db: &Db, inputs: &[PathBuf], recursive: bool, algo: Algo) -> Result<Vec<Item>, String> {
+/// Ids of roots this call created are appended to `new_roots`.
+fn scan(
+    sh: &Shared,
+    db: &Db,
+    inputs: &[PathBuf],
+    recursive: bool,
+    algo: Algo,
+    new_roots: &mut Vec<i64>,
+) -> Result<Vec<Item>, String> {
     let mut sc = Scanner {
         sh,
         db,
@@ -500,20 +577,32 @@ fn scan(sh: &Shared, db: &Db, inputs: &[PathBuf], recursive: bool, algo: Algo) -
             Kind::File => sc.consider(&resolved, meta.size, None),
             Kind::Dir => {
                 let Some(root_str) = resolved.to_str() else {
-                    sh.problem(&resolved, "folder name is not valid Unicode; cannot be tracked".into());
+                    sh.problem(
+                        &resolved,
+                        "folder name is not valid Unicode; cannot be tracked".into(),
+                    );
                     continue;
                 };
-                let root_id = db.add_root(root_str, recursive, now_unix()).map_err(|e| e.to_string())?;
+                let (root_id, created) = db
+                    .add_root(root_str, recursive, now_unix())
+                    .map_err(|e| e.to_string())?;
+                if created {
+                    new_roots.push(root_id);
+                }
                 fsread::walk(&resolved, recursive, &mut |item| {
                     match item {
-                        WalkItem::File { path, meta } => sc.consider(path, meta.size, Some(root_id)),
+                        WalkItem::File { path, meta } => {
+                            sc.consider(path, meta.size, Some(root_id))
+                        }
                         WalkItem::SkippedLink { .. } => sh.with(|s| s.skipped_links += 1),
                         WalkItem::Error { path, error } => sh.problem(path, error.to_string()),
                     }
                     sc.db_err.is_none() && sh.checkpoint()
                 });
             }
-            Kind::Link | Kind::Other => sh.problem(&resolved, "not a regular file or folder".into()),
+            Kind::Link | Kind::Other => {
+                sh.problem(&resolved, "not a regular file or folder".into())
+            }
         }
         if let Some(e) = sc.db_err.take() {
             return Err(e);

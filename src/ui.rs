@@ -5,7 +5,9 @@ use crate::appdata::AppDir;
 use crate::db::{Db, Entry, Root, Scope, Status};
 use crate::engine::{self, Job, JobKind, Phase, Shared, State};
 use crate::hasher::{Algo, to_hex};
-use crate::util::{format_duration, format_unix_nanos, format_unix_secs, group_digits, human_bytes};
+use crate::util::{
+    format_duration, format_unix_nanos, format_unix_secs, group_digits, human_bytes,
+};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -52,7 +54,8 @@ pub fn run() {
         Box::new(|cc| {
             // Rows are selected by clicking, so label text must not swallow
             // clicks; paths and hashes are copied from the right-click menu.
-            cc.egui_ctx.global_style_mut(|s| s.interaction.selectable_labels = false);
+            cc.egui_ctx
+                .global_style_mut(|s| s.interaction.selectable_labels = false);
             Ok(Box::new(app))
         }),
     );
@@ -68,9 +71,18 @@ pub fn run() {
 
 /// A question the user must answer before a job starts.
 enum Confirm {
-    RemoveEntries { ids: Vec<i64> },
-    RemoveRoot { root: Root, entries: u64 },
-    Update { ids: Vec<i64>, possibly_corrupted: u64, acknowledged: bool },
+    RemoveEntries {
+        ids: Vec<i64>,
+    },
+    RemoveRoot {
+        root: Root,
+        entries: u64,
+    },
+    Update {
+        ids: Vec<i64>,
+        possibly_corrupted: u64,
+        acknowledged: bool,
+    },
 }
 
 struct App {
@@ -113,7 +125,10 @@ impl App {
         let appdir = AppDir::locate()?;
         appdir.check_writable()?;
         let db = Db::open(&appdir.db_path()).map_err(|e| {
-            format!("The database could not be opened:\n\n{}\n\n{e}", appdir.db_path().display())
+            format!(
+                "The database could not be opened:\n\n{}\n\n{e}",
+                appdir.db_path().display()
+            )
         })?;
         let mut app = App {
             appdir,
@@ -162,7 +177,14 @@ impl App {
             }
             let (root_counts, loose) = self.db.root_counts()?;
             let ids = self.db.ids_filtered(self.scope, self.search.trim())?;
-            Ok::<_, crate::db::DbError>((roots, root_counts, loose, ids, self.db.count_files()?, self.db.total_size()?))
+            Ok::<_, crate::db::DbError>((
+                roots,
+                root_counts,
+                loose,
+                ids,
+                self.db.count_files()?,
+                self.db.total_size()?,
+            ))
         })();
         match loaded {
             Ok((roots, root_counts, loose, ids, count, size)) => {
@@ -196,18 +218,33 @@ impl App {
         self.speed_samples.clear();
         self.last_job = None;
         self.show_problems = false;
-        self.job = Some(engine::start(self.appdir.db_path(), job, Box::new(move || ctx.request_repaint())));
+        self.job = Some(engine::start(
+            self.appdir.db_path(),
+            job,
+            Box::new(move || ctx.request_repaint()),
+        ));
     }
 
     fn start_add(&mut self, ctx: &egui::Context, inputs: Vec<PathBuf>) {
         if !inputs.is_empty() {
-            self.start_job(ctx, Job::Add { inputs, recursive: self.recursive, algo: self.algo });
+            self.start_job(
+                ctx,
+                Job::Add {
+                    inputs,
+                    recursive: self.recursive,
+                    algo: self.algo,
+                },
+            );
         }
     }
 
     /// The selection in list order.
     fn selected_ids(&self) -> Vec<i64> {
-        self.ids.iter().copied().filter(|id| self.selected.contains(id)).collect()
+        self.ids
+            .iter()
+            .copied()
+            .filter(|id| self.selected.contains(id))
+            .collect()
     }
 
     /// Poll the running job; returns its state, bytes done and current speed in bytes/s.
@@ -220,12 +257,18 @@ impl App {
             self.speed_samples.clear();
         }
         self.speed_samples.push_back((now, bytes));
-        while self.speed_samples.len() > 2 && now.duration_since(self.speed_samples[1].0) >= SPEED_WINDOW {
+        while self.speed_samples.len() > 2
+            && now.duration_since(self.speed_samples[1].0) >= SPEED_WINDOW
+        {
             self.speed_samples.pop_front();
         }
         let (t0, b0) = self.speed_samples[0];
         let dt = now.duration_since(t0).as_secs_f64();
-        let speed = if dt > 0.2 { bytes.saturating_sub(b0) as f64 / dt } else { 0.0 };
+        let speed = if dt > 0.2 {
+            bytes.saturating_sub(b0) as f64 / dt
+        } else {
+            0.0
+        };
 
         if state.phase == Phase::Finished {
             self.job = None;
@@ -400,18 +443,28 @@ impl App {
                             job.set_paused(!s.paused);
                         }
                     }
-                    if ui.button("Cancel").on_hover_text("Stop now. Everything finished so far is kept.").clicked() {
+                    if ui
+                        .button("Cancel")
+                        .on_hover_text("Stop now. Everything finished so far is kept.")
+                        .clicked()
+                    {
                         job.request_cancel();
                     }
                 }
             });
             match s.phase {
                 Phase::Preparing => {
-                    ui.label(format!("{} files found so far", group_digits(s.files_total)));
+                    ui.label(format!(
+                        "{} files found so far",
+                        group_digits(s.files_total)
+                    ));
                 }
                 Phase::Removing => {
                     if s.files_total > 0 {
-                        ui.add(egui::ProgressBar::new(s.files_done as f32 / s.files_total as f32).show_percentage());
+                        ui.add(
+                            egui::ProgressBar::new(s.files_done as f32 / s.files_total as f32)
+                                .show_percentage(),
+                        );
                     } else {
                         ui.spinner();
                     }
@@ -426,8 +479,16 @@ impl App {
                     };
                     ui.add(egui::ProgressBar::new(frac.clamp(0.0, 1.0)).show_percentage());
                     let active = s.active_hashing_secs();
-                    let avg = if active > 0.2 { bytes as f64 / active } else { 0.0 };
-                    let eta = if avg > 0.0 { s.bytes_total.saturating_sub(bytes) as f64 / avg } else { f64::NAN };
+                    let avg = if active > 0.2 {
+                        bytes as f64 / active
+                    } else {
+                        0.0
+                    };
+                    let eta = if avg > 0.0 {
+                        s.bytes_total.saturating_sub(bytes) as f64 / avg
+                    } else {
+                        f64::NAN
+                    };
                     ui.label(format!(
                         "{} / {} files · {} / {} · now {:.0} MB/s · average {:.0} MB/s · ETA {}",
                         group_digits(s.files_done),
@@ -436,12 +497,18 @@ impl App {
                         human_bytes(s.bytes_total),
                         if s.paused { 0.0 } else { speed / 1_048_576.0 },
                         avg / 1_048_576.0,
-                        if s.paused { "paused".to_string() } else { format_duration(eta) },
+                        if s.paused {
+                            "paused".to_string()
+                        } else {
+                            format_duration(eta)
+                        },
                     ));
                 }
             }
             ui.add(
-                egui::Label::new(egui::RichText::new(&s.current).weak()).truncate().show_tooltip_when_elided(false),
+                egui::Label::new(egui::RichText::new(&s.current).weak())
+                    .truncate()
+                    .show_tooltip_when_elided(false),
             );
             return;
         }
@@ -457,7 +524,10 @@ impl App {
                 ui.label(job_summary(s));
                 if s.problem_count > 0 {
                     let label = format!("{} problems", group_digits(s.problem_count));
-                    if ui.link(egui::RichText::new(label).color(ui.visuals().warn_fg_color)).clicked() {
+                    if ui
+                        .link(egui::RichText::new(label).color(ui.visuals().warn_fg_color))
+                        .clicked()
+                    {
                         self.show_problems = !self.show_problems;
                     }
                 }
@@ -477,7 +547,9 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("Search:");
             let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.search).hint_text("part of a path or file name").desired_width(260.0),
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text("part of a path or file name")
+                    .desired_width(260.0),
             );
             let mut changed = resp.changed();
             if !self.search.is_empty() && ui.button("✖").on_hover_text("Clear search").clicked() {
@@ -501,7 +573,10 @@ impl App {
             {
                 self.selected = self.ids.iter().copied().collect();
             }
-            if ui.add_enabled(!self.selected.is_empty(), egui::Button::new("Select none")).clicked() {
+            if ui
+                .add_enabled(!self.selected.is_empty(), egui::Button::new("Select none"))
+                .clicked()
+            {
                 self.selected.clear();
                 self.anchor = None;
             }
@@ -526,84 +601,111 @@ impl App {
         let mut db_error = None;
         let mut clicked: Option<(usize, egui::Modifiers)> = None;
         let mut context_select: Option<usize> = None;
-        TableBuilder::new(ui)
-            .striped(true)
-            .resizable(true)
-            .sense(egui::Sense::click())
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::initial(155.0).at_least(40.0).clip(true))
-            .column(Column::initial(280.0).at_least(60.0).clip(true))
-            .column(Column::initial(280.0).at_least(60.0).clip(true))
-            .column(Column::initial(80.0).at_least(40.0).clip(true))
-            .column(Column::initial(140.0).at_least(40.0).clip(true))
-            .column(Column::initial(75.0).at_least(40.0).clip(true))
-            .column(Column::initial(140.0).at_least(40.0).clip(true))
-            .column(Column::remainder().at_least(40.0).clip(true))
-            .header(22.0, |mut h| {
-                for title in ["Status", "Name", "Folder", "Size", "Modified", "Algorithm", "Hash", "Last verified"] {
-                    h.col(|ui| {
-                        ui.strong(title);
-                    });
-                }
-            })
-            .body(|body| {
-                body.rows(ROW_HEIGHT, ids.len(), |mut row| {
-                    let index = row.index();
-                    let id = ids[index];
-                    if let std::collections::hash_map::Entry::Vacant(slot) = cache.entry(id) {
-                        match db.entry(id) {
-                            Ok(Some(e)) => {
-                                slot.insert(e);
+        // The table scrolls vertically by itself; this adds sideways scrolling
+        // (scroll bar, Shift+wheel, touchpad) when the columns are wider than the window.
+        egui::ScrollArea::horizontal()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(true)
+                    .sense(egui::Sense::click())
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::initial(155.0).at_least(40.0).clip(true))
+                    .column(Column::initial(280.0).at_least(60.0).clip(true))
+                    .column(Column::initial(280.0).at_least(60.0).clip(true))
+                    .column(Column::initial(80.0).at_least(40.0).clip(true))
+                    .column(Column::initial(140.0).at_least(40.0).clip(true))
+                    .column(Column::initial(75.0).at_least(40.0).clip(true))
+                    .column(Column::initial(140.0).at_least(40.0).clip(true))
+                    .column(Column::remainder().at_least(150.0).clip(true))
+                    .header(22.0, |mut h| {
+                        for title in [
+                            "Status",
+                            "Name",
+                            "Folder",
+                            "Size",
+                            "Modified",
+                            "Algorithm",
+                            "Hash",
+                            "Last verified",
+                        ] {
+                            h.col(|ui| {
+                                ui.strong(title);
+                            });
+                        }
+                    })
+                    .body(|body| {
+                        body.rows(ROW_HEIGHT, ids.len(), |mut row| {
+                            let index = row.index();
+                            let id = ids[index];
+                            if let std::collections::hash_map::Entry::Vacant(slot) = cache.entry(id)
+                            {
+                                match db.entry(id) {
+                                    Ok(Some(e)) => {
+                                        slot.insert(e);
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => db_error = Some(e.to_string()),
+                                }
                             }
-                            Ok(None) => {}
-                            Err(e) => db_error = Some(e.to_string()),
-                        }
-                    }
-                    let Some(e) = cache.get(&id) else {
-                        row.col(|ui| {
-                            ui.weak("…");
+                            let Some(e) = cache.get(&id) else {
+                                row.col(|ui| {
+                                    ui.weak("…");
+                                });
+                                return;
+                            };
+                            row.set_selected(selected.contains(&id));
+                            let (folder, name) = split_path(&e.path);
+                            let hex = to_hex(&e.hash);
+                            row.col(|ui| status_label(ui, e));
+                            row.col(|ui| cell(ui, egui::RichText::new(name), &e.path));
+                            row.col(|ui| cell(ui, egui::RichText::new(folder), &e.path));
+                            row.col(|ui| {
+                                let exact = format!("{} bytes", group_digits(e.size));
+                                cell(ui, egui::RichText::new(human_bytes(e.size)), &exact);
+                            });
+                            row.col(|ui| {
+                                ui.label(format_unix_nanos(e.mtime_ns));
+                            });
+                            row.col(|ui| {
+                                ui.label(e.algo.name());
+                            });
+                            row.col(|ui| {
+                                cell(
+                                    ui,
+                                    egui::RichText::new(&hex[..hex.len().min(16)]).monospace(),
+                                    &hex,
+                                )
+                            });
+                            row.col(|ui| {
+                                let first =
+                                    format!("First hashed {}", format_unix_secs(e.first_hashed));
+                                cell(
+                                    ui,
+                                    egui::RichText::new(format_unix_secs(e.last_verified)),
+                                    &first,
+                                );
+                            });
+                            let resp = row.response();
+                            if resp.clicked() {
+                                clicked = Some((index, resp.ctx.input(|i| i.modifiers)));
+                            }
+                            if resp.secondary_clicked() && !selected.contains(&id) {
+                                context_select = Some(index);
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button("Copy full path").clicked() {
+                                    ui.ctx().copy_text(e.path.clone());
+                                    ui.close();
+                                }
+                                if ui.button("Copy hash").clicked() {
+                                    ui.ctx().copy_text(hex.clone());
+                                    ui.close();
+                                }
+                            });
                         });
-                        return;
-                    };
-                    row.set_selected(selected.contains(&id));
-                    let (folder, name) = split_path(&e.path);
-                    let hex = to_hex(&e.hash);
-                    row.col(|ui| status_label(ui, e));
-                    row.col(|ui| cell(ui, egui::RichText::new(name), &e.path));
-                    row.col(|ui| cell(ui, egui::RichText::new(folder), &e.path));
-                    row.col(|ui| {
-                        let exact = format!("{} bytes", group_digits(e.size));
-                        cell(ui, egui::RichText::new(human_bytes(e.size)), &exact);
                     });
-                    row.col(|ui| {
-                        ui.label(format_unix_nanos(e.mtime_ns));
-                    });
-                    row.col(|ui| {
-                        ui.label(e.algo.name());
-                    });
-                    row.col(|ui| cell(ui, egui::RichText::new(&hex[..hex.len().min(16)]).monospace(), &hex));
-                    row.col(|ui| {
-                        let first = format!("First hashed {}", format_unix_secs(e.first_hashed));
-                        cell(ui, egui::RichText::new(format_unix_secs(e.last_verified)), &first);
-                    });
-                    let resp = row.response();
-                    if resp.clicked() {
-                        clicked = Some((index, resp.ctx.input(|i| i.modifiers)));
-                    }
-                    if resp.secondary_clicked() && !selected.contains(&id) {
-                        context_select = Some(index);
-                    }
-                    resp.context_menu(|ui| {
-                        if ui.button("Copy full path").clicked() {
-                            ui.ctx().copy_text(e.path.clone());
-                            ui.close();
-                        }
-                        if ui.button("Copy hash").clicked() {
-                            ui.ctx().copy_text(hex.clone());
-                            ui.close();
-                        }
-                    });
-                });
             });
         if let Some(e) = db_error {
             self.error = Some(e);
@@ -627,7 +729,11 @@ impl App {
             if !mods.command {
                 self.selected.clear();
             }
-            let (lo, hi) = if anchor <= index { (anchor, index) } else { (index, anchor) };
+            let (lo, hi) = if anchor <= index {
+                (anchor, index)
+            } else {
+                (index, anchor)
+            };
             self.selected.extend(self.ids[lo..=hi].iter().copied());
             return;
         }
@@ -645,7 +751,9 @@ impl App {
     // ---------------------------------------------------------------- dialogs
 
     fn confirm_dialog(&mut self, ctx: &egui::Context) {
-        let Some(confirm) = &mut self.confirm else { return };
+        let Some(confirm) = &mut self.confirm else {
+            return;
+        };
         let mut go = false;
         let mut cancel = false;
         let modal = egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
@@ -739,16 +847,22 @@ impl App {
             .default_size([760.0, 320.0])
             .show(ctx, |ui| {
                 if s.problem_count as usize > s.problems.len() {
-                    ui.weak(format!("Showing the first {} of {}.", s.problems.len(), s.problem_count));
+                    ui.weak(format!(
+                        "Showing the first {} of {}.",
+                        s.problems.len(),
+                        s.problem_count
+                    ));
                 }
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    for p in &s.problems {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.monospace(&p.path);
-                            ui.colored_label(ui.visuals().warn_fg_color, &p.message);
-                        });
-                    }
-                });
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for p in &s.problems {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.monospace(&p.path);
+                                ui.colored_label(ui.visuals().warn_fg_color, &p.message);
+                            });
+                        }
+                    });
             });
         self.show_problems = open;
     }
@@ -765,13 +879,18 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.heading(WINDOW_TITLE);
-                ui.label("Detects file changes and bit rot by comparing file hashes with stored ones.");
+                ui.label(
+                    "Detects file changes and bit rot by comparing file hashes with stored ones.",
+                );
                 ui.add_space(6.0);
                 ui.label("hash-check never changes, moves or deletes your files.");
                 ui.label("It only writes inside its own folder:");
                 ui.monospace(self.appdir.dir().display().to_string());
                 ui.add_space(6.0);
-                ui.label(format!("Database schema version {}", crate::db::SCHEMA_VERSION));
+                ui.label(format!(
+                    "Database schema version {}",
+                    crate::db::SCHEMA_VERSION
+                ));
                 ui.label("Licence: GNU GPL v3");
                 ui.hyperlink("https://github.com/camilus123/hash-check");
             });
@@ -779,7 +898,9 @@ impl App {
     }
 
     fn error_window(&mut self, ctx: &egui::Context) {
-        let Some(msg) = self.error.clone() else { return };
+        let Some(msg) = self.error.clone() else {
+            return;
+        };
         egui::Window::new("hash-check")
             .collapsible(false)
             .resizable(false)
@@ -794,16 +915,34 @@ impl App {
 }
 
 fn entries_word(n: u64) -> String {
-    if n == 1 { "1 entry".to_string() } else { format!("{} entries", group_digits(n)) }
+    if n == 1 {
+        "1 entry".to_string()
+    } else {
+        format!("{} entries", group_digits(n))
+    }
 }
 
 fn job_summary(s: &State) -> String {
-    let took = s.finished_at.map(|t| t.duration_since(s.started).as_secs_f64()).unwrap_or(0.0);
+    let took = s
+        .finished_at
+        .map(|t| t.duration_since(s.started).as_secs_f64())
+        .unwrap_or(0.0);
     let verdict = if s.cancelled { "Cancelled" } else { "Done" };
     let mut text = match s.kind {
-        JobKind::Add => format!("{verdict}: {} added in {}", group_digits(s.added), format_duration(took)),
-        JobKind::Update => format!("{verdict}: {} updated in {}", group_digits(s.updated), format_duration(took)),
-        JobKind::Remove => format!("{verdict}: {} removed from the database", entries_word(s.removed)),
+        JobKind::Add => format!(
+            "{verdict}: {} added in {}",
+            group_digits(s.added),
+            format_duration(took)
+        ),
+        JobKind::Update => format!(
+            "{verdict}: {} updated in {}",
+            group_digits(s.updated),
+            format_duration(took)
+        ),
+        JobKind::Remove => format!(
+            "{verdict}: {} removed from the database",
+            entries_word(s.removed)
+        ),
     };
     if s.already_tracked > 0 {
         text += &format!(" · {} already tracked", group_digits(s.already_tracked));
@@ -826,7 +965,12 @@ fn split_path(path: &str) -> (&str, &str) {
 /// tooltip to a label that had to be shortened; with ours on top that made
 /// two identical popups, so the automatic one is switched off here.
 fn cell(ui: &mut egui::Ui, text: egui::RichText, hover: &str) {
-    ui.add(egui::Label::new(text).truncate().show_tooltip_when_elided(false)).on_hover_text(hover);
+    ui.add(
+        egui::Label::new(text)
+            .truncate()
+            .show_tooltip_when_elided(false),
+    )
+    .on_hover_text(hover);
 }
 
 fn status_label(ui: &mut egui::Ui, e: &Entry) {
@@ -840,7 +984,11 @@ fn status_label(ui: &mut egui::Ui, e: &Entry) {
     if e.status == Status::PossiblyCorrupted {
         text = text.strong();
     }
-    let label = ui.add(egui::Label::new(text).truncate().show_tooltip_when_elided(false));
+    let label = ui.add(
+        egui::Label::new(text)
+            .truncate()
+            .show_tooltip_when_elided(false),
+    );
     if let Some(err) = &e.last_error {
         label.on_hover_text(err);
     }
@@ -884,9 +1032,12 @@ impl eframe::App for App {
             self.status_panel(ui, live);
             ui.add_space(4.0);
         });
-        egui::Panel::left("roots").resizable(true).default_size(260.0).show(ui, |ui| {
-            self.roots_panel(ui);
-        });
+        egui::Panel::left("roots")
+            .resizable(true)
+            .default_size(260.0)
+            .show(ui, |ui| {
+                self.roots_panel(ui);
+            });
         egui::CentralPanel::default().show(ui, |ui| {
             self.filter_bar(ui);
             ui.separator();

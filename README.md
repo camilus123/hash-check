@@ -8,7 +8,7 @@ time do not).
 Primary target: Windows 11 x64. The code also builds and passes its tests
 on Linux.
 
-> **Status: 0.2.0, second milestone.** You can add, browse, update and
+> **Status: 0.2.1, second milestone.** You can add, browse, update and
 > remove entries. Verify, reports and performance tuning arrive in the
 > next milestones (see [Roadmap](#roadmap)).
 

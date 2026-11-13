@@ -21,7 +21,10 @@ fn snapshot(dir: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
             if m.is_dir() {
                 stack.push(e.path());
             } else if m.is_file() {
-                out.insert(e.path(), (fs::read(e.path()).unwrap(), m.modified().unwrap()));
+                out.insert(
+                    e.path(),
+                    (fs::read(e.path()).unwrap(), m.modified().unwrap()),
+                );
             }
         }
     }
@@ -42,7 +45,10 @@ fn make_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     put("sub/deeper/c.bin", vec![7u8; 100_000]);
     put("ünïcödé/日本語 файл 🐈.txt", "Mici".as_bytes().to_vec());
     // A path well beyond the classic 260-character Windows limit.
-    let long_dir = (0..8).map(|i| format!("{i}-{}", "x".repeat(40))).collect::<Vec<_>>().join("/");
+    let long_dir = (0..8)
+        .map(|i| format!("{i}-{}", "x".repeat(40)))
+        .collect::<Vec<_>>()
+        .join("/");
     put(&format!("{long_dir}/long-path-file.dat"), b"deep".to_vec());
     files
 }
@@ -55,7 +61,9 @@ fn add_tree_hashes_everything_and_touches_nothing() {
     fs::create_dir_all(&appdir).unwrap();
     let files = make_tree(&data);
     assert!(
-        files.keys().any(|k| data.join(k).to_string_lossy().len() > 300),
+        files
+            .keys()
+            .any(|k| data.join(k).to_string_lossy().len() > 300),
         "test tree must include a long path"
     );
     let before = snapshot(&data);
@@ -78,14 +86,24 @@ fn add_tree_hashes_everything_and_touches_nothing() {
         assert_eq!(ids.len(), files.len());
         for id in ids {
             let e = db.entry(id).unwrap().unwrap();
-            let rel = Path::new(&e.path).strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
-            let content = files.get(&rel).unwrap_or_else(|| panic!("unexpected entry {rel}"));
+            let rel = Path::new(&e.path)
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let content = files
+                .get(&rel)
+                .unwrap_or_else(|| panic!("unexpected entry {rel}"));
             assert_eq!(e.hash, hash_bytes(algo, content), "{rel}");
             assert_eq!(e.size, content.len() as u64);
             assert_eq!(e.algo, algo);
             assert_eq!(e.status, Status::Ok);
             assert_eq!(e.root_id, Some(roots[0].id));
-            assert!(!e.path.starts_with(r"\\?\"), "stored paths must be in plain form: {}", e.path);
+            assert!(
+                !e.path.starts_with(r"\\?\"),
+                "stored paths must be in plain form: {}",
+                e.path
+            );
         }
     }
 
@@ -120,7 +138,12 @@ fn non_recursive_add_and_loose_files() {
 
     // A single file is a loose entry, not a root; the same file given twice is hashed once.
     let loose = data.join("sub").join("b.txt");
-    let st = add_blocking(&db_path, &[loose.clone(), loose.clone()], true, Algo::Xxh3_128);
+    let st = add_blocking(
+        &db_path,
+        &[loose.clone(), loose.clone()],
+        true,
+        Algo::Xxh3_128,
+    );
     assert_eq!((st.added, st.files_total), (1, 1));
     let db = Db::open(&db_path).unwrap();
     assert_eq!(db.roots().unwrap().len(), 1);
@@ -137,7 +160,12 @@ fn non_recursive_add_and_loose_files() {
 #[test]
 fn missing_input_is_reported_not_fatal() {
     let tmp = tempfile::tempdir().unwrap();
-    let st = add_blocking(&tmp.path().join("t.db"), &[tmp.path().join("does-not-exist")], true, Algo::Blake3);
+    let st = add_blocking(
+        &tmp.path().join("t.db"),
+        &[tmp.path().join("does-not-exist")],
+        true,
+        Algo::Blake3,
+    );
     assert!(st.fatal.is_none());
     assert_eq!(st.added, 0);
     assert_eq!(st.problem_count, 1);

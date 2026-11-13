@@ -38,7 +38,10 @@ pub fn hash_file(
     // Refuse links up front: we hash what the entry is, not where it points.
     let pre = fsread::stat(path)?;
     if pre.kind != Kind::File {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
     }
     let mut f = fsread::open(path)?;
     let before: FileMeta = f.meta()?;
@@ -67,5 +70,9 @@ pub fn hash_file(
     if !unchanged {
         return Ok(HashOutcome::ChangedDuringHash);
     }
-    Ok(HashOutcome::Done { hash: hasher.finalize(), size: before.size, mtime_ns: before.mtime_ns })
+    Ok(HashOutcome::Done {
+        hash: hasher.finalize(),
+        size: before.size,
+        mtime_ns: before.mtime_ns,
+    })
 }

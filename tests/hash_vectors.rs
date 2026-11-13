@@ -14,18 +14,78 @@ fn pattern(n: usize) -> Vec<u8> {
 }
 
 const VECTORS: &[(Algo, &str, usize, &str)] = &[
-    (Algo::Blake3, "empty", 0, "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"),
-    (Algo::Xxh3_128, "empty", 0, "99aa06d3014798d86001c324468d497f"),
-    (Algo::Sha256, "empty", 0, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
-    (Algo::Blake3, "pattern", 1000, "beb16c4780ceb84cec6cf34484eb280d8d7faaa5970da29b2aaf08bc2efdd795"),
-    (Algo::Xxh3_128, "pattern", 1000, "e719034ed2c87a3684b0c79e3e1ac40e"),
-    (Algo::Sha256, "pattern", 1000, "008549d94fa71e7a0a483d84380d05a923a4b18e79ba1f8a8ddac923956d32ef"),
-    (Algo::Blake3, "pattern", 3_000_001, "daceb13f0328accf668e885eeeccfebeedda5f1863d7778bc99c5332018fb0fe"),
-    (Algo::Xxh3_128, "pattern", 3_000_001, "923bf7eac1e68f670d8f86900a9ce1ba"),
-    (Algo::Sha256, "pattern", 3_000_001, "88f6072481ae464b10be82bfdae476ef79e6c58e7535044dbb5d93488aa8ff98"),
-    (Algo::Blake3, "pattern", 9_000_003, "4b57b5ac847b252a9ab952b50afac8e364c24877ed9787187be6dfe0df4ac8ee"),
-    (Algo::Xxh3_128, "pattern", 9_000_003, "dc1a1585e62853634612e067b2c72179"),
-    (Algo::Sha256, "pattern", 9_000_003, "e7adf09a0ac95d8ad682c651b5ad1baa13f94e0a4ba75f964fd157fe09beff66"),
+    (
+        Algo::Blake3,
+        "empty",
+        0,
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+    ),
+    (
+        Algo::Xxh3_128,
+        "empty",
+        0,
+        "99aa06d3014798d86001c324468d497f",
+    ),
+    (
+        Algo::Sha256,
+        "empty",
+        0,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    ),
+    (
+        Algo::Blake3,
+        "pattern",
+        1000,
+        "beb16c4780ceb84cec6cf34484eb280d8d7faaa5970da29b2aaf08bc2efdd795",
+    ),
+    (
+        Algo::Xxh3_128,
+        "pattern",
+        1000,
+        "e719034ed2c87a3684b0c79e3e1ac40e",
+    ),
+    (
+        Algo::Sha256,
+        "pattern",
+        1000,
+        "008549d94fa71e7a0a483d84380d05a923a4b18e79ba1f8a8ddac923956d32ef",
+    ),
+    (
+        Algo::Blake3,
+        "pattern",
+        3_000_001,
+        "daceb13f0328accf668e885eeeccfebeedda5f1863d7778bc99c5332018fb0fe",
+    ),
+    (
+        Algo::Xxh3_128,
+        "pattern",
+        3_000_001,
+        "923bf7eac1e68f670d8f86900a9ce1ba",
+    ),
+    (
+        Algo::Sha256,
+        "pattern",
+        3_000_001,
+        "88f6072481ae464b10be82bfdae476ef79e6c58e7535044dbb5d93488aa8ff98",
+    ),
+    (
+        Algo::Blake3,
+        "pattern",
+        9_000_003,
+        "4b57b5ac847b252a9ab952b50afac8e364c24877ed9787187be6dfe0df4ac8ee",
+    ),
+    (
+        Algo::Xxh3_128,
+        "pattern",
+        9_000_003,
+        "dc1a1585e62853634612e067b2c72179",
+    ),
+    (
+        Algo::Sha256,
+        "pattern",
+        9_000_003,
+        "e7adf09a0ac95d8ad682c651b5ad1baa13f94e0a4ba75f964fd157fe09beff66",
+    ),
 ];
 
 #[test]
@@ -34,7 +94,10 @@ fn published_abc_vectors() {
         to_hex(&hash_bytes(Algo::Blake3, b"abc")),
         "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
     );
-    assert_eq!(to_hex(&hash_bytes(Algo::Xxh3_128, b"abc")), "06b05ab6733a618578af5f94892f3950");
+    assert_eq!(
+        to_hex(&hash_bytes(Algo::Xxh3_128, b"abc")),
+        "06b05ab6733a618578af5f94892f3950"
+    );
     assert_eq!(
         to_hex(&hash_bytes(Algo::Sha256, b"abc")),
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -62,7 +125,12 @@ fn streaming_in_odd_chunks_matches_reference() {
             for part in data.chunks(chunk) {
                 h.update(part, false);
             }
-            assert_eq!(to_hex(&h.finalize()), expected, "{} / {n} bytes / chunks of {chunk}", algo.name());
+            assert_eq!(
+                to_hex(&h.finalize()),
+                expected,
+                "{} / {n} bytes / chunks of {chunk}",
+                algo.name()
+            );
         }
     }
 }
@@ -103,7 +171,10 @@ fn files_hash_to_reference_including_larger_than_buffer() {
             }
         }
     }
-    assert!(9_000_003 > 2 * BUF_SIZE, "largest vector must span several read buffers");
+    assert!(
+        9_000_003 > 2 * BUF_SIZE,
+        "largest vector must span several read buffers"
+    );
 }
 
 #[test]

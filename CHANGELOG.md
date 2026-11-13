@@ -4,6 +4,19 @@ Versions are `x.y.z`: `x` for major changes, `y` for added features, `z` for
 bug fixes. `1.0.0` will be the first release that meets the whole project
 brief.
 
+## 0.2.1 (2026-11-13)
+
+### Fixed
+- The entry list could not be scrolled sideways when its columns were wider
+  than the window. It now has a horizontal scroll bar (Shift+wheel and
+  touchpad scrolling work too).
+- Adding a folder and cancelling before any file was hashed left an empty
+  root behind. A stopped Add now removes roots it created that received no
+  entries; roots that already existed, or that got at least one entry, stay.
+- Characters missing from the built-in font (full-width punctuation such as
+  "：", Chinese, Japanese, Korean) showed as empty boxes in file names.
+  Fonts installed with the operating system are now used as fallbacks.
+
 ## 0.2.0 (2026-11-13)
 
 Second milestone: the full window for managing entries.

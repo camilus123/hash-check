@@ -36,8 +36,13 @@ fn entries_round_trip_with_mixed_algorithms() {
     let path = dir.path().join("t.db");
     {
         let db = Db::open(&path).unwrap();
-        let root = db.add_root("/data/photos", true, 5).unwrap();
-        assert_eq!(db.add_root("/data/photos", true, 9).unwrap(), root, "same root, same id");
+        let (root, created) = db.add_root("/data/photos", true, 5).unwrap();
+        assert!(created);
+        assert_eq!(
+            db.add_root("/data/photos", true, 9).unwrap(),
+            (root, false),
+            "same root, same id"
+        );
         db.begin().unwrap();
         for (i, algo) in Algo::ALL.into_iter().enumerate() {
             let hash = hash_bytes(algo, b"content");
@@ -75,7 +80,14 @@ fn entries_round_trip_with_mixed_algorithms() {
     }
     let roots = db.roots().unwrap();
     assert_eq!(roots.len(), 1);
-    assert_eq!((roots[0].path.as_str(), roots[0].recursive, roots[0].added_at), ("/data/photos", true, 5));
+    assert_eq!(
+        (
+            roots[0].path.as_str(),
+            roots[0].recursive,
+            roots[0].added_at
+        ),
+        ("/data/photos", true, 5)
+    );
     assert!(db.entry(999_999).unwrap().is_none());
 }
 
@@ -84,7 +96,10 @@ fn adding_never_overwrites_a_stored_hash() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(&dir.path().join("t.db")).unwrap();
     assert!(insert(&db, "/a", Algo::Blake3, b"original"));
-    assert!(!insert(&db, "/a", Algo::Sha256, b"different"), "second insert must be refused");
+    assert!(
+        !insert(&db, "/a", Algo::Sha256, b"different"),
+        "second insert must be refused"
+    );
     let e = db.entry(db.all_ids().unwrap()[0]).unwrap().unwrap();
     assert_eq!(e.algo, Algo::Blake3);
     assert_eq!(e.hash, hash_bytes(Algo::Blake3, b"original"));
@@ -116,13 +131,20 @@ const CRASH_BATCH: u64 = 100;
 /// batches forever until it is killed. Does nothing when run normally.
 #[test]
 fn crash_child() {
-    let Ok(path) = std::env::var(CRASH_ENV) else { return };
+    let Ok(path) = std::env::var(CRASH_ENV) else {
+        return;
+    };
     let db = Db::open(Path::new(&path)).unwrap();
     let mut n = 0u64;
     loop {
         db.begin().unwrap();
         for _ in 0..CRASH_BATCH {
-            insert(&db, &format!("/crash/{n:012}"), Algo::Xxh3_128, &n.to_le_bytes());
+            insert(
+                &db,
+                &format!("/crash/{n:012}"),
+                Algo::Xxh3_128,
+                &n.to_le_bytes(),
+            );
             n += 1;
         }
         db.commit().unwrap();
@@ -156,10 +178,20 @@ fn killed_writer_leaves_a_sound_database() {
         child.wait().unwrap();
 
         let db = Db::open(&round_path).unwrap();
-        assert!(db.integrity_check().unwrap(), "database damaged by kill (round {round})");
+        assert!(
+            db.integrity_check().unwrap(),
+            "database damaged by kill (round {round})"
+        );
         let count = db.count_files().unwrap();
-        assert!(count >= CRASH_BATCH * 3, "committed batches were lost: {count}");
-        assert_eq!(count % CRASH_BATCH, 0, "a partial batch became visible: {count}");
+        assert!(
+            count >= CRASH_BATCH * 3,
+            "committed batches were lost: {count}"
+        );
+        assert_eq!(
+            count % CRASH_BATCH,
+            0,
+            "a partial batch became visible: {count}"
+        );
         // Every surviving row is intact.
         let ids = db.all_ids().unwrap();
         for id in [ids[0], ids[ids.len() / 2], ids[ids.len() - 1]] {
@@ -187,12 +219,29 @@ fn migration_backs_up_first_and_keeps_data() {
     assert!(db.file_exists("/precious").unwrap());
     assert!(db.integrity_check().unwrap());
 
-    let backup = db.backup_made.clone().expect("a backup must be made before migrating");
+    let backup = db
+        .backup_made
+        .clone()
+        .expect("a backup must be made before migrating");
     assert!(backup.exists());
-    assert_eq!(backup.parent(), path.parent(), "backup must sit next to the database");
-    assert!(backup.file_name().unwrap().to_string_lossy().starts_with("t.db.backup-v1-"));
+    assert_eq!(
+        backup.parent(),
+        path.parent(),
+        "backup must sit next to the database"
+    );
+    assert!(
+        backup
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("t.db.backup-v1-")
+    );
     let old = Db::open_with(&backup, v1).unwrap();
-    assert_eq!(old.schema_version().unwrap(), 1, "backup must hold the old schema");
+    assert_eq!(
+        old.schema_version().unwrap(),
+        1,
+        "backup must hold the old schema"
+    );
     assert!(old.file_exists("/precious").unwrap());
     assert!(old.integrity_check().unwrap());
 
@@ -210,11 +259,17 @@ fn failed_migration_changes_nothing() {
         let db = Db::open_with(&path, v1).unwrap();
         insert(&db, "/precious", Algo::Blake3, b"data");
     }
-    let broken: Vec<&str> =
-        vec![MIGRATIONS[0], "ALTER TABLE files ADD COLUMN note TEXT; THIS IS NOT SQL;"];
+    let broken: Vec<&str> = vec![
+        MIGRATIONS[0],
+        "ALTER TABLE files ADD COLUMN note TEXT; THIS IS NOT SQL;",
+    ];
     assert!(Db::open_with(&path, &broken).is_err());
     let db = Db::open_with(&path, v1).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 1, "version must not advance on failure");
+    assert_eq!(
+        db.schema_version().unwrap(),
+        1,
+        "version must not advance on failure"
+    );
     assert!(db.file_exists("/precious").unwrap());
     assert!(db.integrity_check().unwrap());
 }
@@ -226,12 +281,21 @@ fn database_from_a_newer_version_is_refused() {
     let future: Vec<&str> = vec![MIGRATIONS[0], "CREATE TABLE from_the_future (x)"];
     drop(Db::open_with(&path, &future).unwrap());
     match Db::open(&path) {
-        Err(DbError::NewerSchema { found: 2, supported }) => assert_eq!(supported, SCHEMA_VERSION),
+        Err(DbError::NewerSchema {
+            found: 2,
+            supported,
+        }) => assert_eq!(supported, SCHEMA_VERSION),
         Err(e) => panic!("wrong error: {e}"),
         Ok(_) => panic!("a newer database must not be opened"),
     }
     // Still intact for the newer program.
-    assert_eq!(Db::open_with(&path, &future).unwrap().schema_version().unwrap(), 2);
+    assert_eq!(
+        Db::open_with(&path, &future)
+            .unwrap()
+            .schema_version()
+            .unwrap(),
+        2
+    );
 }
 
 #[test]
