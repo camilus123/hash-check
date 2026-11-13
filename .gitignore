@@ -1,0 +1,20 @@
+# Build output
+/target/
+
+# hash-check runtime data (database, backups, settings, logs, reports).
+# These live next to the executable and must never be committed.
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.db.backup-*
+hash-check-settings.*
+/logs/
+/reports/
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
