@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "hash-check"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "chrono",

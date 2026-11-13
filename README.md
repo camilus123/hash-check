@@ -8,9 +8,9 @@ time do not).
 Primary target: Windows 11 x64. The code also builds and passes its tests
 on Linux.
 
-> **Status: 0.1.1, first milestone.** You can add files and folders, hash
-> them and browse the stored entries. Verify, Update, Remove, reports and
-> performance tuning arrive in the next milestones (see [Roadmap](#roadmap)).
+> **Status: 0.2.0, second milestone.** You can add, browse, update and
+> remove entries. Verify, reports and performance tuning arrive in the
+> next milestones (see [Roadmap](#roadmap)).
 
 ## The read-only guarantee
 
@@ -35,19 +35,37 @@ write to (not `Program Files`) and run it.
 
 ## Using it
 
-1. Pick the hash algorithm for new entries:
-   - **BLAKE3** (default): fast, cryptographic, uses all cores.
-   - **XXH3-128**: fastest, not cryptographic. Fine against bit rot, not
-     against deliberate tampering.
-   - **SHA-256**: for comparing with hashes from other tools.
-2. Click **Add files…** or **Add folder…**, or drop files and folders onto
-   the window. With **Include subfolders** ticked, a folder is added as a
-   whole tree.
-3. Watch progress at the bottom. **Cancel** stops at once and keeps
-   everything hashed so far.
+**Adding.** Pick the hash algorithm for new entries, then click
+**Add files…** or **Add folder…**, or drop files and folders onto the
+window. With **Include subfolders** ticked, a folder is added as a whole
+tree. Each added folder is remembered as a root and appears in the left
+panel.
+
+- **BLAKE3** (default): fast, cryptographic, uses all cores.
+- **XXH3-128**: fastest, not cryptographic. Fine against bit rot, not
+  against deliberate tampering.
+- **SHA-256**: for comparing with hashes from other tools.
 
 Adding a file that is already tracked does nothing: a stored hash is never
 overwritten by Add.
+
+**Browsing.** Click a root in the left panel to see only its entries, or
+type in the search box. Select rows with click, Ctrl+click, Shift+click or
+Ctrl+A. Right-click a row to copy its path or hash.
+
+**Update.** Select entries and click **Update…** to re-hash them and
+replace the stored hashes. Use it for files you changed on purpose. If a
+selected entry is flagged *possibly corrupted*, a warning must be
+acknowledged first, because updating would accept the damaged content as
+correct.
+
+**Remove.** Select entries and click **Remove…**, or select a root and
+click **Remove this root…**. Only database entries are removed; files on
+disk are never touched.
+
+**While a job runs** the bottom panel shows files and bytes done, current
+and average speed, ETA and the current file. **Pause** holds the job,
+**Cancel** stops it and keeps everything finished so far.
 
 ## Where data is stored
 
@@ -92,6 +110,10 @@ cargo test
 - **Add job**: Unicode names, a path longer than 260 characters, links not
   followed, files changing mid-hash, and a check that the user's files are
   byte-for-byte and timestamp-for-timestamp unchanged afterwards.
+- **Managing entries**: Remove (entries and roots) leaves files on disk
+  alone, Update replaces the hash and keeps the algorithm, a failed Update
+  leaves the entry as it was, Pause holds a job without locking the
+  database, Cancel keeps finished work.
 - **Read-only audit**: described above.
 
 Tests create and alter only files they made themselves in a temporary
@@ -106,8 +128,8 @@ SSD and HDD are part of milestone 0.4.0.
 
 | Version | Content |
 |---|---|
-| 0.1.0 | Core hashing, database, tests, CI, minimal window (this version) |
-| 0.2.0 | Full GUI: roots panel, Remove, Update with confirmations, Pause |
+| 0.1.0 | Core hashing, database, tests, CI, minimal window |
+| 0.2.0 | Full GUI: roots panel, Remove, Update with confirmations, Pause (this version) |
 | 0.3.0 | Verify (OK / Changed / Possibly corrupted / Missing / Unreadable / New), filters, CSV and text reports |
 | 0.4.0 | Per-drive threading, sequential HDD mode, drive settings, benchmark |
 | 1.0.0 | Robustness pass and benchmark results |

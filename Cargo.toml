@@ -1,6 +1,6 @@
 [package]
 name = "hash-check"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "GUI file-integrity checker: detects file changes and bit rot by comparing hashes"
 license = "GPL-3.0-only"

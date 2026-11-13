@@ -4,6 +4,31 @@ Versions are `x.y.z`: `x` for major changes, `y` for added features, `z` for
 bug fixes. `1.0.0` will be the first release that meets the whole project
 brief.
 
+## 0.2.0 (2026-11-13)
+
+Second milestone: the full window for managing entries.
+
+### Added
+- Left panel listing every tracked root with its entry count, plus "All
+  entries" and "Single files"; click one to show only its entries.
+- Remove: delete the selected entries, or a whole root with its entries,
+  from the database after a confirmation. Nothing on disk is touched.
+- Update: re-hash the selected entries and replace their stored hashes,
+  after a confirmation. If any of them is flagged "possibly corrupted" a
+  red warning appears and must be acknowledged first. Each entry keeps the
+  algorithm it was created with.
+- Pause and Resume for hashing jobs. A paused job holds no database lock,
+  and paused time is left out of the average speed and ETA.
+- Row selection as in Explorer: click, Ctrl+click, Shift+click, Ctrl+A,
+  "Select all" and "Select none".
+- Search box that filters the list by any part of the path.
+- Right-click menu on rows (copy full path, copy hash) and on roots.
+
+### Changed
+- The path is shown as two columns, Name and Folder, so the file name stays
+  visible for long paths.
+- Removing runs on the background thread like hashing does.
+
 ## 0.1.1 (2026-11-13)
 
 ### Fixed
