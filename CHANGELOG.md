@@ -4,6 +4,12 @@ Versions are `x.y.z`: `x` for major changes, `y` for added features, `z` for
 bug fixes. `1.0.0` will be the first release that meets the whole project
 brief.
 
+## 0.1.1 (2026-11-13)
+
+### Fixed
+- Hovering over a path that did not fit its column showed two identical
+  pop-ups with the full path instead of one.
+
 ## 0.1.0 (2026-11-13)
 
 First milestone: core hashing and database, with a minimal window.

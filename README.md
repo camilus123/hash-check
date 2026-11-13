@@ -8,7 +8,7 @@ time do not).
 Primary target: Windows 11 x64. The code also builds and passes its tests
 on Linux.
 
-> **Status: 0.1.0, first milestone.** You can add files and folders, hash
+> **Status: 0.1.1, first milestone.** You can add files and folders, hash
 > them and browse the stored entries. Verify, Update, Remove, reports and
 > performance tuning arrive in the next milestones (see [Roadmap](#roadmap)).
 

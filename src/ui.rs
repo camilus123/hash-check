@@ -390,10 +390,11 @@ impl App {
                     };
                     row.col(|ui| status_label(ui, e.status));
                     row.col(|ui| {
-                        ui.label(&e.path).on_hover_text(&e.path);
+                        cell(ui, egui::RichText::new(&e.path), &e.path);
                     });
                     row.col(|ui| {
-                        ui.label(human_bytes(e.size)).on_hover_text(format!("{} bytes", group_digits(e.size)));
+                        let exact = format!("{} bytes", group_digits(e.size));
+                        cell(ui, egui::RichText::new(human_bytes(e.size)), &exact);
                     });
                     row.col(|ui| {
                         ui.label(format_unix_nanos(e.mtime_ns));
@@ -403,7 +404,7 @@ impl App {
                     });
                     row.col(|ui| {
                         let hex = to_hex(&e.hash);
-                        ui.monospace(&hex[..hex.len().min(16)]).on_hover_text(&hex);
+                        cell(ui, egui::RichText::new(&hex[..hex.len().min(16)]).monospace(), &hex);
                     });
                     row.col(|ui| {
                         ui.label(format_unix_secs(e.last_verified));
@@ -414,6 +415,13 @@ impl App {
             self.error = Some(e);
         }
     }
+}
+
+/// A table cell with exactly one tooltip. egui adds its own "full text"
+/// tooltip to a label that had to be shortened; with ours on top that made
+/// two identical popups, so the automatic one is switched off here.
+fn cell(ui: &mut egui::Ui, text: egui::RichText, hover: &str) {
+    ui.add(egui::Label::new(text).show_tooltip_when_elided(false)).on_hover_text(hover);
 }
 
 fn status_label(ui: &mut egui::Ui, status: Status) {
