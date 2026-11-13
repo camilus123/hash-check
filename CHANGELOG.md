@@ -4,6 +4,15 @@ Versions are `x.y.z`: `x` for major changes, `y` for added features, `z` for
 bug fixes. `1.0.0` will be the first release that meets the whole project
 brief.
 
+## 0.2.2 (2026-11-13)
+
+### Fixed
+- On Windows, full-width punctuation in file names ("：", "？", "｜" and
+  similar, as written by download tools) still showed as empty boxes: the
+  0.2.1 fix only covered characters that belong to a specific script. A
+  second fallback now searches the fonts that ship with Windows for any
+  character the others cannot draw.
+
 ## 0.2.1 (2026-11-13)
 
 ### Fixed

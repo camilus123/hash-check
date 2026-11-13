@@ -7,11 +7,13 @@
 //! - [`hashfile`] hashes one file through `fsread`, detecting changes mid-hash.
 //! - [`db`]      SQLite storage with schema versioning and pre-migration backups.
 //! - [`engine`]  background jobs with progress and cancellation.
+//! - [`fonts`]   fallback fonts for characters the built-in font lacks.
 //! - [`ui`]      the egui front end.
 
 pub mod appdata;
 pub mod db;
 pub mod engine;
+pub mod fonts;
 pub mod fsread;
 pub mod hasher;
 pub mod hashfile;

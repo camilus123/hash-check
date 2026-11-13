@@ -56,6 +56,7 @@ pub fn run() {
             // clicks; paths and hashes are copied from the right-click menu.
             cc.egui_ctx
                 .global_style_mut(|s| s.interaction.selectable_labels = false);
+            crate::fonts::install(&cc.egui_ctx);
             Ok(Box::new(app))
         }),
     );

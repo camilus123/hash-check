@@ -136,6 +136,27 @@ impl ReadOnlyFile {
     }
 }
 
+/// Read a whole file into memory, refusing anything larger than `max`
+/// bytes. Used for system fonts, never for files being hashed.
+pub fn read_whole(path: &Path, max: u64) -> io::Result<Vec<u8>> {
+    let mut f = open(path)?;
+    let size = f.meta()?.size;
+    if size > max {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
+    }
+    let mut data = vec![0u8; size as usize];
+    let mut filled = 0;
+    while filled < data.len() {
+        let n = f.read(&mut data[filled..])?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    data.truncate(filled);
+    Ok(data)
+}
+
 /// What [`walk`] reports.
 pub enum WalkItem<'a> {
     File {
