@@ -4,6 +4,39 @@ Versions are `x.y.z`: `x` for major changes, `y` for added features, `z` for
 bug fixes. `1.0.0` will be the first release that meets the whole project
 brief.
 
+## 0.3.0 (2026-11-13)
+
+Third milestone: verification.
+
+### Added
+- Verify: everything, one root, or the selected entries. Each file is
+  re-hashed with the algorithm its entry was created with and classified:
+  - **OK**: hash matches (a changed timestamp alone is still OK).
+  - **Changed**: hash differs and size and/or modified time differ.
+  - **Possibly corrupted**: hash differs although size and modified time
+    are identical. Shown in red, with a red banner across the window that
+    stays (also after a restart) until dismissed.
+  - **Missing**: the file no longer exists.
+  - **Unreadable**: I/O error or access denied, with the OS error text.
+  - **New**: a file under a tracked root that is not in the database, with
+    a button to add all or the selected ones.
+- Verify never changes a stored hash. For problem files the stored size
+  and modified time are kept too, so repeating the check gives the same
+  answer; restoring the original content brings a file back to OK.
+- Entries on a drive that is not connected are reported as "drive not
+  available" and left untouched, not marked missing.
+- Summary after each verification, live counts while it runs, filter chips
+  per classification with counts, "Last verification only" filter, and a
+  Details column explaining each finding.
+- Export of the last verification as CSV or plain text, problems first,
+  into `reports\` next to the program or to a location you pick.
+  hash-check refuses to overwrite an existing file when exporting.
+
+### Changed
+- Database schema version 2 (verification runs and the list of new files).
+  An existing database is upgraded automatically after a backup copy
+  (`hash-check.db.backup-v1-<time>`) has been written next to it.
+
 ## 0.2.2 (2026-11-13)
 
 ### Fixed

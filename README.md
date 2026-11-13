@@ -8,9 +8,9 @@ time do not).
 Primary target: Windows 11 x64. The code also builds and passes its tests
 on Linux.
 
-> **Status: 0.2.2, second milestone.** You can add, browse, update and
-> remove entries. Verify, reports and performance tuning arrive in the
-> next milestones (see [Roadmap](#roadmap)).
+> **Status: 0.3.0, third milestone.** Add, browse, update, remove, verify
+> and report all work. Performance tuning (per-drive threading, HDD mode)
+> and benchmarks arrive next (see [Roadmap](#roadmap)).
 
 ## The read-only guarantee
 
@@ -21,7 +21,9 @@ hash-check never modifies, renames, moves or deletes your files.
 - All access to user files goes through one module, [`src/fsread.rs`](src/fsread.rs),
   which exposes only "read" and "get metadata".
 - The only place the program writes is its own folder (see
-  [`src/appdata.rs`](src/appdata.rs)).
+  [`src/appdata.rs`](src/appdata.rs)). The single exception is a report
+  you export to a location you pick yourself; that file is always created
+  new, and an existing file is never overwritten.
 - [`tests/readonly_audit.rs`](tests/readonly_audit.rs) fails the build if
   `fsread.rs` gains any call that could change the file system, or if any
   other module touches file-system APIs.
@@ -63,6 +65,23 @@ correct.
 click **Remove this root…**. Only database entries are removed; files on
 disk are never touched.
 
+**Verify.** Open the **Verify** menu and choose everything, the selected
+root, or the selected entries. Every file is re-hashed and classified:
+
+| Result | Meaning |
+|---|---|
+| OK | The hash matches. |
+| Changed | The hash differs and so does the size and/or modified time. Probably a normal edit; use Update if you made it. |
+| **Possibly corrupted** | The hash differs although size and modified time are identical. This is what bit rot looks like. A red banner stays on screen until you dismiss it. |
+| Missing | The file no longer exists. |
+| Unreadable | The file could not be read; the OS error is shown. A read error on a file that used to be fine is a warning sign. |
+| New | A file inside a tracked folder that is not in the database. Use the **New** filter to add them. |
+
+Verify never changes a stored hash. If a drive is not connected, its
+entries are reported as "drive not available" and left as they were. Use
+the chips above the list to filter by result, and **Export report…** to
+save the last verification as CSV or text.
+
 **While a job runs** the bottom panel shows files and bytes done, current
 and average speed, ETA and the current file. **Pause** holds the job,
 **Cancel** stops it and keeps everything finished so far.
@@ -75,6 +94,7 @@ Everything lives next to `hash-check.exe`:
 |---|---|
 | `hash-check.db` | The SQLite database (plus `-wal`/`-shm` files while running) |
 | `hash-check.db.backup-v<N>-<time>` | Automatic copy made before a schema upgrade |
+| `reports\` | Exported verification reports (unless you pick another location) |
 
 Per file the database holds: full path, size, modified time, hash,
 algorithm, time first hashed, time last verified and the last result. The
@@ -114,6 +134,13 @@ cargo test
   alone, Update replaces the hash and keeps the algorithm, a failed Update
   leaves the entry as it was, Pause holds a job without locking the
   database, Cancel keeps finished work.
+- **Verification**: every classification on real files (touched, edited,
+  resized, bit-flipped with the timestamp restored, deleted, replaced by a
+  folder, locked by another program, permission denied), new-file
+  detection, an offline drive, cancelling, restoring a file, and a check
+  that verifying leaves the files on disk untouched.
+- **Reports**: CSV and text content and ordering, quoting of awkward file
+  names, and refusal to overwrite an existing file.
 - **Read-only audit**: described above.
 
 Tests create and alter only files they made themselves in a temporary
@@ -129,8 +156,8 @@ SSD and HDD are part of milestone 0.4.0.
 | Version | Content |
 |---|---|
 | 0.1.0 | Core hashing, database, tests, CI, minimal window |
-| 0.2.0 | Full GUI: roots panel, Remove, Update with confirmations, Pause (this version) |
-| 0.3.0 | Verify (OK / Changed / Possibly corrupted / Missing / Unreadable / New), filters, CSV and text reports |
+| 0.2.0 | Full GUI: roots panel, Remove, Update with confirmations, Pause |
+| 0.3.0 | Verify (OK / Changed / Possibly corrupted / Missing / Unreadable / New), filters, CSV and text reports (this version) |
 | 0.4.0 | Per-drive threading, sequential HDD mode, drive settings, benchmark |
 | 1.0.0 | Robustness pass and benchmark results |
 
