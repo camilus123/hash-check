@@ -207,6 +207,7 @@ fn file_changed_while_hashing_is_discarded() {
             parallel: true,
             direct: false,
         },
+        None,
         &mut |_| {
             if !appended {
                 // Another program appends while we are part-way through.
@@ -229,6 +230,7 @@ fn file_changed_while_hashing_is_discarded() {
             parallel: true,
             direct: false,
         },
+        None,
         &mut |_| true,
     )
     .unwrap();
@@ -247,6 +249,7 @@ fn hashing_can_be_cancelled_mid_file() {
         Algo::Sha256,
         &mut buf,
         HashOpts::default(),
+        None,
         &mut |_| {
             blocks += 1;
             false
@@ -255,4 +258,110 @@ fn hashing_can_be_cancelled_mid_file() {
     .unwrap();
     assert_eq!(out, HashOutcome::Cancelled);
     assert_eq!(blocks, 1, "must stop after the first block");
+}
+
+/// A file with several names (hard links) is read once; every name is
+/// tracked with the same hash.
+#[test]
+fn hard_links_are_read_once_and_all_tracked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    fs::create_dir_all(data.join("links")).unwrap();
+    let content = vec![5u8; 3_000_000];
+    fs::write(data.join("original.bin"), &content).unwrap();
+    if fs::hard_link(
+        data.join("original.bin"),
+        data.join("links").join("second name.bin"),
+    )
+    .is_err()
+    {
+        eprintln!("this file system has no hard links; skipping");
+        return;
+    }
+    fs::hard_link(
+        data.join("original.bin"),
+        data.join("links").join("third name.bin"),
+    )
+    .unwrap();
+    fs::write(data.join("unrelated.bin"), &content).unwrap(); // same content, different file
+
+    let db_path = tmp.path().join("t.db");
+    let st = add_blocking(&db_path, &[data.clone()], true, Algo::Sha256);
+    assert_eq!(st.problem_count, 0, "{:?}", st.problems);
+    assert_eq!(st.added, 4, "every name is tracked");
+    assert_eq!(
+        st.hard_links_reused, 2,
+        "the linked data is read once, not three times"
+    );
+    let db = Db::open(&db_path).unwrap();
+    for id in db.all_ids().unwrap() {
+        let e = db.entry(id).unwrap().unwrap();
+        assert_eq!(e.hash, hash_bytes(Algo::Sha256, &content), "{}", e.path);
+        assert_eq!(e.size, 3_000_000);
+    }
+}
+
+#[test]
+fn recycle_bin_and_restore_points_are_recognised_only_at_a_drive_root() {
+    use hash_check::fsread::is_system_folder_at_volume_root as sys;
+    #[cfg(windows)]
+    {
+        assert!(sys(Path::new(r"D:\$RECYCLE.BIN")));
+        assert!(sys(Path::new(r"D:\System Volume Information")));
+        assert!(sys(Path::new(r"d:\$recycle.bin")));
+        assert!(
+            !sys(Path::new(r"D:\data\$RECYCLE.BIN")),
+            "only directly under the drive root"
+        );
+        assert!(!sys(Path::new(r"D:\Photos")));
+    }
+    assert!(!sys(Path::new("/home/user/System Volume Information")));
+    assert!(!sys(Path::new("relative")));
+}
+
+#[test]
+fn every_job_is_written_to_the_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    make_tree(&data);
+    let app = tmp.path().join("app");
+    fs::create_dir_all(&app).unwrap();
+    let db_path = app.join("hash-check.db");
+    add_blocking(
+        &db_path,
+        &[data.clone(), tmp.path().join("missing")],
+        true,
+        Algo::Blake3,
+    );
+    let log_path = hash_check::appdata::AppDir::at(&app).log_path();
+    assert_eq!(
+        log_path,
+        app.join("logs").join("hash-check.log"),
+        "the log lives in the app folder"
+    );
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("Add (BLAKE3, with subfolders)"), "{log}");
+    assert!(log.contains("finished"), "{log}");
+    assert!(log.contains("6 added"), "{log}");
+    assert!(
+        log.contains("problem:"),
+        "the missing input is logged: {log}"
+    );
+
+    // Later jobs append.
+    hash_check::engine::run_blocking(&db_path, hash_check::engine::Job::CheckDatabase);
+    let log2 = fs::read_to_string(&log_path).unwrap();
+    assert!(
+        log2.starts_with(&log) && log2.contains("Check database"),
+        "{log2}"
+    );
+}
+
+#[test]
+fn database_check_reports_a_sound_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("hash-check.db");
+    let st = hash_check::engine::run_blocking(&db_path, hash_check::engine::Job::CheckDatabase);
+    assert!(st.fatal.is_none());
+    assert!(st.message.unwrap().contains("passed"));
 }

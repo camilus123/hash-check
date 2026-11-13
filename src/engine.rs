@@ -10,7 +10,7 @@ use crate::db::{Db, DbResult, NewEntry, Scope, Status};
 use crate::drives::{Detector, DrivePlan, MAX_THREADS};
 use crate::fsread::{self, Kind, WalkItem};
 use crate::hasher::Algo;
-use crate::hashfile::{HashOpts, HashOutcome, ReadBuf, hash_file};
+use crate::hashfile::{HashOpts, HashOutcome, LinkCache, ReadBuf, hash_file};
 use crate::report::{self, Format};
 use crate::util::now_unix;
 use crate::verify::{Fingerprint, Verdict, classify, volume_root};
@@ -50,6 +50,8 @@ pub enum Job {
     Verify { target: VerifyTarget },
     /// Hash files that Verify found under a root and start tracking them.
     AddNew { new_file_ids: Vec<i64>, algo: Algo },
+    /// Run SQLite's full integrity check on the database.
+    CheckDatabase,
     /// Measure hashing speed on existing files (read-only) and in memory.
     Benchmark {
         inputs: Vec<PathBuf>,
@@ -91,6 +93,7 @@ pub enum JobKind {
     Verify,
     Export,
     Benchmark,
+    CheckDatabase,
 }
 
 /// One measured line of a benchmark.
@@ -160,6 +163,11 @@ pub struct State {
     pub already_tracked: u64,
     /// Links and junctions that were not followed.
     pub skipped_links: u64,
+    /// Files not read again because they are hard links to a file already
+    /// hashed in this run.
+    pub hard_links_reused: u64,
+    /// A message for the user when the job finishes (database check).
+    pub message: Option<String>,
     /// Files whose size or modified time changed while being hashed.
     pub changed_during_hash: u64,
     pub problem_count: u64,
@@ -233,6 +241,8 @@ impl Shared {
                 removed: 0,
                 already_tracked: 0,
                 skipped_links: 0,
+                hard_links_reused: 0,
+                message: None,
                 changed_during_hash: 0,
                 problem_count: 0,
                 problems: Vec::new(),
@@ -332,6 +342,7 @@ impl Job {
             Job::Verify { .. } => JobKind::Verify,
             Job::Export { .. } => JobKind::Export,
             Job::Benchmark { .. } => JobKind::Benchmark,
+            Job::CheckDatabase => JobKind::CheckDatabase,
         }
     }
 }
@@ -376,6 +387,17 @@ pub fn add_blocking(db_path: &Path, inputs: &[PathBuf], recursive: bool, algo: A
 }
 
 fn run(sh: &Shared, db_path: &Path, job: Job) {
+    let what = job.describe();
+    run_job(sh, db_path, job);
+    // Keep a plain-text record of every job next to the database. A log
+    // that cannot be written must never fail the job itself.
+    if let Some(dir) = db_path.parent() {
+        let _ = AppDir::at(dir).append_log(&log_text(&what, &sh.snapshot()));
+    }
+    sh.with(|s| s.phase = Phase::Finished);
+}
+
+fn run_job(sh: &Shared, db_path: &Path, job: Job) {
     let result = Db::open(db_path)
         .map_err(|e| e.to_string())
         .and_then(|mut db| match job {
@@ -394,13 +416,13 @@ fn run(sh: &Shared, db_path: &Path, job: Job) {
                 inputs,
                 limit_bytes,
             } => run_benchmark(sh, &db, &inputs, limit_bytes),
+            Job::CheckDatabase => run_check_database(sh, &db),
         });
     sh.with(|s| {
         if let Err(msg) = result {
             s.fatal = Some(msg);
         }
         s.cancelled = sh.cancelled();
-        s.phase = Phase::Finished;
         s.current.clear();
         if let Some(since) = s.paused_since.take() {
             s.paused_total += since.elapsed();
@@ -584,7 +606,8 @@ pub fn drive_threads_key(volume: &str) -> String {
     format!("drive_threads:{volume}")
 }
 
-/// Meta key: "1" when reads should bypass the OS file cache.
+/// Meta key: "0" when reads should go through the OS file cache instead of
+/// bypassing it (direct I/O, the default).
 pub const DIRECT_IO_KEY: &str = "direct_io";
 
 fn drive_threads_setting(db: &Db, volume: &str) -> DbResult<Option<usize>> {
@@ -595,7 +618,9 @@ fn drive_threads_setting(db: &Db, volume: &str) -> DbResult<Option<usize>> {
 }
 
 fn direct_io_setting(db: &Db) -> DbResult<bool> {
-    Ok(db.meta(DIRECT_IO_KEY)?.as_deref() == Some("1"))
+    // On unless switched off: the benchmark showed no speed difference on
+    // any drive type, and direct reads guarantee the data comes from the disk.
+    Ok(db.meta(DIRECT_IO_KEY)?.as_deref() != Some("0"))
 }
 
 /// Run every pool with its own threads, all drives at the same time.
@@ -690,6 +715,7 @@ fn hash_one(
     path: &Path,
     algo: Algo,
     planned_size: u64,
+    links: Option<&LinkCache>,
 ) -> std::io::Result<HashOutcome> {
     sh.set_current(path);
     let opts = HashOpts {
@@ -699,7 +725,7 @@ fn hash_one(
         direct: ctx.direct,
     };
     let mut read: u64 = 0;
-    let outcome = hash_file(path, algo, &mut ctx.buf, opts, &mut |n| {
+    let outcome = hash_file(path, algo, &mut ctx.buf, opts, links, &mut |n| {
         read += n;
         sh.bytes_done.fetch_add(n, Ordering::Relaxed);
         sh.checkpoint()
@@ -744,6 +770,7 @@ fn hash_items(
     sh: &Shared,
     db: &Db,
     items: &[Item],
+    links: Option<&LinkCache>,
     store: &mut dyn FnMut(&Item, &[u8], u64, i64) -> DbResult<()>,
 ) -> Result<(), String> {
     let mut grouper = Grouper::new(db);
@@ -765,17 +792,23 @@ fn hash_items(
         direct,
         &|ctx, item: &Item| {
             Ok(
-                match hash_one(sh, ctx, Path::new(&item.path), item.algo, item.size) {
+                match hash_one(sh, ctx, Path::new(&item.path), item.algo, item.size, links) {
                     Ok(HashOutcome::Done {
                         hash,
                         size,
                         mtime_ns,
-                    }) => Some(Hashed::Done {
-                        item,
-                        hash,
-                        size,
-                        mtime_ns,
-                    }),
+                        reused,
+                    }) => {
+                        if reused {
+                            sh.with(|s| s.hard_links_reused += 1);
+                        }
+                        Some(Hashed::Done {
+                            item,
+                            hash,
+                            size,
+                            mtime_ns,
+                        })
+                    }
                     Ok(HashOutcome::ChangedDuringHash) => Some(Hashed::ChangedDuringHash(item)),
                     Ok(HashOutcome::Cancelled) => None,
                     Err(e) => Some(Hashed::Failed(item, e)),
@@ -827,25 +860,31 @@ fn run_add(
         if sh.cancelled() {
             return Ok(());
         }
-        hash_items(sh, db, &items, &mut |p, hash, size, mtime_ns| {
-            let inserted = db.insert_entry(&NewEntry {
-                path: &p.path,
-                root_id: p.root_id,
-                size,
-                mtime_ns,
-                algo: p.algo,
-                hash,
-                now: now_unix(),
-            })?;
-            sh.with(|s| {
-                if inserted {
-                    s.added += 1
-                } else {
-                    s.already_tracked += 1
-                }
-            });
-            Ok(())
-        })
+        hash_items(
+            sh,
+            db,
+            &items,
+            Some(&LinkCache::new()),
+            &mut |p, hash, size, mtime_ns| {
+                let inserted = db.insert_entry(&NewEntry {
+                    path: &p.path,
+                    root_id: p.root_id,
+                    size,
+                    mtime_ns,
+                    algo: p.algo,
+                    hash,
+                    now: now_unix(),
+                })?;
+                sh.with(|s| {
+                    if inserted {
+                        s.added += 1
+                    } else {
+                        s.already_tracked += 1
+                    }
+                });
+                Ok(())
+            },
+        )
     });
     // A run that was stopped must not leave behind a root it created but
     // never stored a file for. (A completed run keeps even an empty folder
@@ -879,7 +918,7 @@ fn run_update(sh: &Shared, db: &Db, ids: &[i64]) -> Result<(), String> {
             sh.with(|s| s.files_total = items.len() as u64);
         }
     }
-    hash_items(sh, db, &items, &mut |p, hash, size, mtime_ns| {
+    hash_items(sh, db, &items, None, &mut |p, hash, size, mtime_ns| {
         let id = p.id.expect("update items carry an id");
         if db.replace_hash(id, size, mtime_ns, hash, now_unix())? {
             sh.with(|s| s.updated += 1);
@@ -905,26 +944,32 @@ fn run_add_new(sh: &Shared, db: &Db, new_file_ids: &[i64], algo: Algo) -> Result
             });
         }
     }
-    hash_items(sh, db, &items, &mut |p, hash, size, mtime_ns| {
-        // Storing the entry also takes the file off the "new" list.
-        let inserted = db.insert_entry(&NewEntry {
-            path: &p.path,
-            root_id: p.root_id,
-            size,
-            mtime_ns,
-            algo: p.algo,
-            hash,
-            now: now_unix(),
-        })?;
-        sh.with(|s| {
-            if inserted {
-                s.added += 1
-            } else {
-                s.already_tracked += 1
-            }
-        });
-        Ok(())
-    })
+    hash_items(
+        sh,
+        db,
+        &items,
+        Some(&LinkCache::new()),
+        &mut |p, hash, size, mtime_ns| {
+            // Storing the entry also takes the file off the "new" list.
+            let inserted = db.insert_entry(&NewEntry {
+                path: &p.path,
+                root_id: p.root_id,
+                size,
+                mtime_ns,
+                algo: p.algo,
+                hash,
+                now: now_unix(),
+            })?;
+            sh.with(|s| {
+                if inserted {
+                    s.added += 1
+                } else {
+                    s.already_tracked += 1
+                }
+            });
+            Ok(())
+        },
+    )
 }
 
 /// Remembers which volumes are reachable, asking the OS once per volume.
@@ -1029,11 +1074,12 @@ fn verify_one(
                 "this is no longer a regular file".into(),
             )
         }
-        Ok(_) => match hash_one(sh, ctx, path, entry.algo, entry.size) {
+        Ok(_) => match hash_one(sh, ctx, path, entry.algo, entry.size, None) {
             Ok(HashOutcome::Done {
                 hash,
                 size,
                 mtime_ns,
+                ..
             }) => {
                 let stored = Fingerprint {
                     hash: &entry.hash,
@@ -1296,6 +1342,137 @@ fn run_verify(
     Ok(())
 }
 
+fn run_check_database(sh: &Shared, db: &Db) -> Result<(), String> {
+    sh.with(|s| s.phase = Phase::Writing);
+    let sound = db.integrity_check().map_err(|e| e.to_string())?;
+    if !sound {
+        return Err(
+            "the database FAILED its integrity check. Stop using it and restore a backup copy \
+                    (hash-check.db.backup-...) or rebuild it by adding your folders again"
+                .into(),
+        );
+    }
+    let entries = db.count_files().map_err(|e| e.to_string())?;
+    sh.with(|s| {
+        s.message = Some(format!(
+            "The database passed the full integrity check.\n{entries} entries, schema version {}.",
+            crate::db::SCHEMA_VERSION
+        ));
+    });
+    Ok(())
+}
+
+impl Job {
+    /// One line for the log.
+    fn describe(&self) -> String {
+        match self {
+            Job::Add {
+                inputs,
+                recursive,
+                algo,
+            } => format!(
+                "Add ({}, {}): {}",
+                algo.name(),
+                if *recursive {
+                    "with subfolders"
+                } else {
+                    "without subfolders"
+                },
+                inputs
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            Job::Update { ids } => format!("Update {} entries", ids.len()),
+            Job::RemoveEntries { ids } => format!("Remove {} entries from the database", ids.len()),
+            Job::RemoveRoot { root_id } => format!("Remove root #{root_id} from the database"),
+            Job::Verify { target } => match target {
+                VerifyTarget::All => "Verify everything".to_string(),
+                VerifyTarget::Root(id) => format!("Verify root #{id}"),
+                VerifyTarget::Entries(ids) => format!("Verify {} selected entries", ids.len()),
+            },
+            Job::AddNew { new_file_ids, algo } => {
+                format!("Add {} new files ({})", new_file_ids.len(), algo.name())
+            }
+            Job::Export { run, .. } => format!("Export report of run {run}"),
+            Job::Benchmark { inputs, .. } => format!(
+                "Benchmark: {}",
+                inputs
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            Job::CheckDatabase => "Check database".to_string(),
+        }
+    }
+}
+
+/// What a finished job writes to the log file.
+fn log_text(what: &str, s: &State) -> String {
+    let took = s
+        .finished_at
+        .map(|t| t.duration_since(s.started).as_secs_f64())
+        .unwrap_or(0.0);
+    let mut out = format!(
+        "{}  {what}\n    {} after {:.1} s",
+        crate::util::format_unix_secs(now_unix()),
+        match (&s.fatal, s.cancelled) {
+            (Some(_), _) => "FAILED",
+            (None, true) => "cancelled",
+            (None, false) => "finished",
+        },
+        took
+    );
+    let mut facts: Vec<String> = Vec::new();
+    let mut fact = |n: u64, name: &str| {
+        if n > 0 {
+            facts.push(format!("{n} {name}"));
+        }
+    };
+    fact(s.added, "added");
+    fact(s.updated, "updated");
+    fact(s.removed, "removed");
+    fact(s.already_tracked, "already tracked");
+    fact(s.hard_links_reused, "hard links not read twice");
+    fact(s.skipped_links, "links not followed");
+    fact(s.changed_during_hash, "changed while being read");
+    if s.kind == JobKind::Verify {
+        let v = &s.verify;
+        facts.push(format!(
+            "run {}: {} OK, {} changed, {} POSSIBLY CORRUPTED, {} missing, {} unreadable, {} new, {} on unavailable drives",
+            s.run_id, v.ok, v.changed, v.possibly_corrupted, v.missing, v.unreadable, v.new, v.unavailable
+        ));
+    }
+    if let Some(p) = &s.report_path {
+        facts.push(format!("report {}", p.display()));
+    }
+    for r in &s.bench {
+        facts.push(format!("{}: {:.0} MB/s", r.label, r.mb_per_s()));
+    }
+    if !facts.is_empty() {
+        out += &format!(": {}", facts.join(", "));
+    }
+    out.push('\n');
+    for plan in &s.plans {
+        out += &format!("    drive {plan}\n");
+    }
+    if let Some(f) = &s.fatal {
+        out += &format!("    error: {f}\n");
+    }
+    for p in &s.problems {
+        out += &format!("    problem: {}: {}\n", p.path, p.message);
+    }
+    if s.problem_count as usize > s.problems.len() {
+        out += &format!(
+            "    ... and {} more problems\n",
+            s.problem_count as usize - s.problems.len()
+        );
+    }
+    out
+}
+
 /// Amount of in-memory data hashed per algorithm for the CPU-only figures.
 const BENCH_MEMORY_BLOCK: usize = 64 * 1024 * 1024;
 const BENCH_MEMORY_ROUNDS: usize = 16;
@@ -1392,7 +1569,7 @@ fn run_benchmark(sh: &Shared, db: &Db, inputs: &[PathBuf], limit_bytes: u64) -> 
             direct,
             &|ctx, item: &Item| {
                 Ok(
-                    match hash_one(sh, ctx, Path::new(&item.path), algo, item.size) {
+                    match hash_one(sh, ctx, Path::new(&item.path), algo, item.size, None) {
                         Ok(HashOutcome::Done { size, .. }) => Some(Ok(size)),
                         Ok(HashOutcome::ChangedDuringHash) => Some(Ok(0)),
                         Ok(HashOutcome::Cancelled) => None,

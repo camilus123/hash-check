@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 
 pub const DB_FILE: &str = "hash-check.db";
 pub const REPORTS_DIR: &str = "reports";
+pub const LOGS_DIR: &str = "logs";
+pub const LOG_FILE: &str = "hash-check.log";
+/// The log is rotated (one old copy kept) when it grows beyond this.
+const LOG_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct AppDir {
@@ -59,6 +63,30 @@ impl AppDir {
                     self.dir.display()
                 )
             })
+    }
+
+    pub fn log_path(&self) -> PathBuf {
+        self.dir.join(LOGS_DIR).join(LOG_FILE)
+    }
+
+    /// Append text to `logs\\hash-check.log` in the app folder.
+    pub fn append_log(&self, text: &str) -> io::Result<()> {
+        use io::Write;
+        let path = self.log_path();
+        fs::create_dir_all(self.dir.join(LOGS_DIR))?;
+        if fs::metadata(&path)
+            .map(|m| m.len() > LOG_ROTATE_BYTES)
+            .unwrap_or(false)
+        {
+            let old = path.with_extension("log.1");
+            let _ = fs::remove_file(&old);
+            fs::rename(&path, &old)?;
+        }
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        f.write_all(text.as_bytes())
     }
 
     pub fn reports_dir(&self) -> PathBuf {
