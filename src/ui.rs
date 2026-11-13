@@ -184,6 +184,9 @@ struct App {
     /// Summary of the last finished job, shown until the next one starts.
     last_job: Option<State>,
     last_list_refresh: Instant,
+    /// How long the last reload took; with millions of entries it is
+    /// noticeable, so reloads during a job are spaced out accordingly.
+    last_refresh_cost: Duration,
     speed_samples: VecDeque<(Instant, u64)>,
 
     confirm: Option<Confirm>,
@@ -237,6 +240,7 @@ impl App {
             job: None,
             last_job: None,
             last_list_refresh: Instant::now(),
+            last_refresh_cost: Duration::ZERO,
             speed_samples: VecDeque::new(),
             confirm: None,
             show_about: false,
@@ -255,6 +259,7 @@ impl App {
 
     /// Reload everything shown from the database.
     fn refresh(&mut self) {
+        let refresh_started = Instant::now();
         let loaded = (|| {
             let roots = self.db.roots()?;
             // A root removed elsewhere must not leave the view pointing at nothing.
@@ -324,6 +329,7 @@ impl App {
             }
             Err(e) => self.error = Some(e.to_string()),
         }
+        self.last_refresh_cost = refresh_started.elapsed();
         self.last_list_refresh = Instant::now();
     }
 
@@ -341,7 +347,7 @@ impl App {
             }
             Ok::<_, crate::db::DbError>((
                 drives,
-                self.db.meta(DIRECT_IO_KEY)?.as_deref() == Some("1"),
+                self.db.meta(DIRECT_IO_KEY)?.as_deref() != Some("0"),
             ))
         })();
         match loaded {
@@ -449,6 +455,9 @@ impl App {
                 });
                 self.corrupted_banner_dismissed = false;
             }
+            if let Some(message) = &state.message {
+                self.info = Some(message.clone());
+            }
             if state.kind == JobKind::Benchmark && !state.bench.is_empty() {
                 self.bench_result = Some((
                     state.bench_info.clone(),
@@ -465,7 +474,9 @@ impl App {
             self.last_job = Some(state.clone());
             self.refresh();
         } else {
-            if self.last_list_refresh.elapsed() >= LIST_REFRESH && !state.paused {
+            // Spend at most about 5% of the time reloading the list.
+            let interval = LIST_REFRESH.max(self.last_refresh_cost * 20);
+            if self.last_list_refresh.elapsed() >= interval && !state.paused {
                 self.refresh();
             }
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -603,6 +614,14 @@ impl App {
                     && ui.button("Show last benchmark").clicked()
                 {
                     self.bench_result = Some((last.bench_info.clone(), last.bench.clone(), last.cancelled));
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(idle, egui::Button::new("Check database"))
+                    .on_hover_text("Run SQLite's full integrity check on hash-check's own database.")
+                    .clicked()
+                {
+                    self.start_job(ui.ctx(), Job::CheckDatabase);
                     ui.close();
                 }
                 ui.separator();
@@ -770,6 +789,7 @@ impl App {
         if let Some((s, bytes, speed)) = live.filter(|(s, _, _)| s.phase != Phase::Finished) {
             ui.horizontal(|ui| {
                 let what = match (s.kind, s.phase) {
+                    (JobKind::CheckDatabase, _) => "Checking the database…",
                     (_, Phase::Removing) => "Removing entries from the database…",
                     (_, Phase::Writing) | (JobKind::Export, _) => "Writing report…",
                     (JobKind::Verify, Phase::Preparing) => "Verifying: looking for new files…",
@@ -1594,6 +1614,9 @@ impl App {
                     "Database schema version {}",
                     crate::db::SCHEMA_VERSION
                 ));
+                ui.label("Log of every job:");
+                ui.monospace(self.appdir.log_path().display().to_string());
+                ui.add_space(6.0);
                 ui.label("Licence: GNU GPL v3");
                 ui.hyperlink("https://github.com/camilus123/hash-check");
             });
@@ -1798,7 +1821,7 @@ impl App {
 
     fn info_window(&mut self, ctx: &egui::Context) {
         let Some(msg) = self.info.clone() else { return };
-        egui::Window::new("Report")
+        egui::Window::new("hash-check")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -1808,7 +1831,8 @@ impl App {
                     if ui.button("OK").clicked() {
                         self.info = None;
                     }
-                    if ui.button("Copy path").clicked()
+                    if msg.starts_with("Report saved")
+                        && ui.button("Copy path").clicked()
                         && let Some(path) = msg.lines().nth(1)
                     {
                         ui.ctx().copy_text(path.to_string());
@@ -1908,6 +1932,13 @@ fn job_summary(s: &State) -> String {
             format_duration(took)
         ),
         JobKind::Benchmark => format!("{verdict}: benchmark took {}", format_duration(took)),
+        JobKind::CheckDatabase => {
+            if s.fatal.is_none() {
+                "Database check passed".to_string()
+            } else {
+                "Database check FAILED".to_string()
+            }
+        }
         JobKind::Export => match &s.report_path {
             Some(p) if s.fatal.is_none() => format!("Report saved: {}", p.display()),
             _ => "Report not saved".to_string(),
@@ -1918,6 +1949,12 @@ fn job_summary(s: &State) -> String {
     }
     if s.skipped_links > 0 {
         text += &format!(" · {} links not followed", group_digits(s.skipped_links));
+    }
+    if s.hard_links_reused > 0 {
+        text += &format!(
+            " · {} hard links read once",
+            group_digits(s.hard_links_reused)
+        );
     }
     text
 }
