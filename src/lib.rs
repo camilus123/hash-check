@@ -8,12 +8,14 @@
 //! - [`db`]      SQLite storage with schema versioning and pre-migration backups.
 //! - [`verify`]  classification of a re-hashed file; which volume a path is on.
 //! - [`report`]  CSV and text verification reports.
-//! - [`engine`]  background jobs with progress and cancellation.
+//! - [`drives`]  which physical drive a path is on and how it should be read.
+//! - [`engine`]  background jobs, scheduled per drive, with progress and cancellation.
 //! - [`fonts`]   fallback fonts for characters the built-in font lacks.
 //! - [`ui`]      the egui front end.
 
 pub mod appdata;
 pub mod db;
+pub mod drives;
 pub mod engine;
 pub mod fonts;
 pub mod fsread;

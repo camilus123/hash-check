@@ -117,3 +117,58 @@ fn fsread_opens_files_read_only() {
     assert!(text.contains("o.read(true);"));
     assert!(text.contains("FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE"));
 }
+
+/// Drive detection talks to Windows directly. It must be the only place
+/// that does, and its volume handle must carry no access rights at all.
+#[test]
+fn drive_detection_opens_volumes_without_any_access_rights() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    for entry in std::fs::read_dir(&src).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let text = std::fs::read_to_string(&path).unwrap();
+        if name != "drives.rs" {
+            for token in [
+                "CreateFileW",
+                "DeviceIoControl",
+                "extern \"system\"",
+                "#[link(",
+            ] {
+                assert!(
+                    !text.contains(token),
+                    "{name} must not call the Windows API directly ({token})"
+                );
+            }
+            continue;
+        }
+        let calls: Vec<_> = code_lines(&text)
+            .filter(|(_, l)| l.contains("CreateFileW("))
+            .collect();
+        assert_eq!(
+            calls.len(),
+            2,
+            "one declaration and one call of CreateFileW expected"
+        );
+        assert!(text.contains("const NO_ACCESS: u32 = 0;"));
+        let call_at = text.rfind("CreateFileW(").unwrap();
+        let args = &text[call_at..call_at + 200];
+        assert!(
+            args.contains("NO_ACCESS"),
+            "the volume must be opened with no access rights: {args}"
+        );
+        for token in [
+            "GENERIC_",
+            "FILE_WRITE",
+            "FILE_READ_DATA",
+            "0x4000_0000",
+            "0x8000_0000",
+            "WriteFile",
+            "FSCTL_",
+        ] {
+            assert!(
+                !text.contains(token),
+                "drives.rs must stay query-only ({token})"
+            );
+        }
+    }
+}
