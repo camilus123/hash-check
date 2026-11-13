@@ -4,6 +4,33 @@ Versions are `x.y.z`: `x` for major changes, `y` for added features, `z` for
 bug fixes. `1.0.0` will be the first release that meets the whole project
 brief.
 
+## 0.4.0 (2026-11-13)
+
+Fourth milestone: performance.
+
+### Added
+- Hashing is scheduled per physical drive, all drives at the same time.
+  SSDs are read with several files in parallel; hard disks are read one
+  file at a time, with BLAKE3 spreading that one stream over all cores.
+  Two volumes on the same physical disk share one queue.
+- Drive detection on Windows (SSD or HDD, NVMe/SATA/USB, model, physical
+  disk number), using a volume handle with no access rights.
+- "Drives" list in the left panel with a per-drive setting: Auto, or a
+  fixed number of files to read in parallel.
+- Optional direct I/O ("Read past the file cache" in the Tools menu), so
+  verified data really comes from the drive and not from memory. Falls
+  back to normal reads where a drive does not support it.
+- Built-in benchmark (Tools menu): reads files you choose, read-only, once
+  per algorithm past the file cache, plus in-memory figures for the CPU
+  alone. Results can be copied as a Markdown table.
+- The status panel shows how each drive is being read.
+
+### Changed
+- Add, Update, Verify and "add new" all run on the new scheduler. Large
+  files (16 MB and up) use multithreaded BLAKE3 even when several files
+  are read in parallel.
+- Read buffers are aligned for direct I/O.
+
 ## 0.3.0 (2026-11-13)
 
 Third milestone: verification.

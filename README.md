@@ -8,9 +8,9 @@ time do not).
 Primary target: Windows 11 x64. The code also builds and passes its tests
 on Linux.
 
-> **Status: 0.3.0, third milestone.** Add, browse, update, remove, verify
-> and report all work. Performance tuning (per-drive threading, HDD mode)
-> and benchmarks arrive next (see [Roadmap](#roadmap)).
+> **Status: 0.4.0, fourth milestone.** All features are in place. What is
+> left for 1.0.0 is a robustness pass and real benchmark numbers (see
+> [Roadmap](#roadmap)).
 
 ## The read-only guarantee
 
@@ -141,15 +141,44 @@ cargo test
   that verifying leaves the files on disk untouched.
 - **Reports**: CSV and text content and ordering, quoting of awkward file
   names, and refusal to overwrite an existing file.
-- **Read-only audit**: described above.
+- **Scheduling**: 1, 2, 8 and 32 threads and direct I/O all produce the
+  same database; parallel and sequential Verify agree file by file; the
+  benchmark changes nothing; drive detection runs on the test machine.
+- **Read-only audit**: described above, plus a check that drive detection
+  opens volumes with no access rights.
 
 Tests create and alter only files they made themselves in a temporary
 directory.
 
+## Performance
+
+Work is scheduled per physical drive, and all drives run at the same time:
+
+- **SSD**: several files are read in parallel (NVMe: half the logical
+  CPUs, at most 16; SATA: 4). Files of 16 MB and more additionally use
+  BLAKE3's multithreaded mode.
+- **Hard disk**: one file at a time, in path order, because parallel reads
+  make the head seek back and forth. BLAKE3 spreads that one stream over
+  all cores; XXH3 and SHA-256 hash it on one core, which is still far
+  faster than a disk can deliver data.
+- **Unknown or removable**: treated like a hard disk.
+
+The **Drives** list in the left panel shows what was detected and lets you
+override the number of parallel files per drive. **Tools > Read past the
+file cache** switches to direct I/O.
+
+All three algorithms pick the fastest instructions the CPU offers at
+runtime (AVX2/SSE4.1 for BLAKE3 and XXH3, SHA extensions for SHA-256),
+with portable fallbacks.
+
 ## Benchmarks
 
-Not measured yet. A built-in benchmark and numbers for each algorithm on
-SSD and HDD are part of milestone 0.4.0.
+**Tools > Benchmark…** measures your own drives: choose a folder or files
+(they are only read), and it reports MB/s for each algorithm, reading past
+the file cache so the drive is really measured, plus in-memory figures.
+
+Numbers for the reference machine (Ryzen 9 5950X, NVMe SSD, SATA SSD and a
+12 TB hard disk) will be added here for 1.0.0.
 
 ## Roadmap
 
@@ -157,8 +186,8 @@ SSD and HDD are part of milestone 0.4.0.
 |---|---|
 | 0.1.0 | Core hashing, database, tests, CI, minimal window |
 | 0.2.0 | Full GUI: roots panel, Remove, Update with confirmations, Pause |
-| 0.3.0 | Verify (OK / Changed / Possibly corrupted / Missing / Unreadable / New), filters, CSV and text reports (this version) |
-| 0.4.0 | Per-drive threading, sequential HDD mode, drive settings, benchmark |
+| 0.3.0 | Verify (OK / Changed / Possibly corrupted / Missing / Unreadable / New), filters, CSV and text reports |
+| 0.4.0 | Per-drive threading, sequential HDD mode, drive settings, benchmark (this version) |
 | 1.0.0 | Robustness pass and benchmark results |
 
 ## Licence
