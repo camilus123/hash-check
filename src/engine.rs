@@ -7,9 +7,10 @@
 
 use crate::appdata::{AppDir, ReportWriter};
 use crate::db::{Db, DbResult, NewEntry, Scope, Status};
+use crate::drives::{Detector, DrivePlan, MAX_THREADS};
 use crate::fsread::{self, Kind, WalkItem};
 use crate::hasher::Algo;
-use crate::hashfile::{HashOutcome, hash_file};
+use crate::hashfile::{HashOpts, HashOutcome, ReadBuf, hash_file};
 use crate::report::{self, Format};
 use crate::util::now_unix;
 use crate::verify::{Fingerprint, Verdict, classify, volume_root};
@@ -49,6 +50,11 @@ pub enum Job {
     Verify { target: VerifyTarget },
     /// Hash files that Verify found under a root and start tracking them.
     AddNew { new_file_ids: Vec<i64>, algo: Algo },
+    /// Measure hashing speed on existing files (read-only) and in memory.
+    Benchmark {
+        inputs: Vec<PathBuf>,
+        limit_bytes: u64,
+    },
     /// Write the report of a verification run.
     Export {
         run: i64,
@@ -84,6 +90,25 @@ pub enum JobKind {
     Remove,
     Verify,
     Export,
+    Benchmark,
+}
+
+/// One measured line of a benchmark.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BenchRow {
+    pub label: String,
+    pub bytes: u64,
+    pub secs: f64,
+}
+
+impl BenchRow {
+    pub fn mb_per_s(&self) -> f64 {
+        if self.secs > 0.0 {
+            self.bytes as f64 / 1_048_576.0 / self.secs
+        } else {
+            0.0
+        }
+    }
 }
 
 /// Results of a Verify job so far.
@@ -152,6 +177,14 @@ pub struct State {
     pub run_id: i64,
     /// Verify: drives that were not connected, with the number of entries skipped.
     pub unavailable_volumes: Vec<(String, u64)>,
+    /// Benchmark: results so far.
+    pub bench: Vec<BenchRow>,
+    /// Benchmark: what was measured (files, drive, CPU).
+    pub bench_info: String,
+    /// Benchmark: what is being measured right now.
+    pub bench_step: String,
+    /// How each drive involved is being read, for display.
+    pub plans: Vec<String>,
     /// Export: where the report was written.
     pub report_path: Option<PathBuf>,
     paused_since: Option<Instant>,
@@ -212,6 +245,10 @@ impl Shared {
                 verify: VerifyCounts::default(),
                 run_id: 0,
                 unavailable_volumes: Vec::new(),
+                bench: Vec::new(),
+                bench_info: String::new(),
+                bench_step: String::new(),
+                plans: Vec::new(),
                 report_path: None,
                 paused_since: None,
                 paused_total: Duration::ZERO,
@@ -262,6 +299,17 @@ impl Shared {
         f(&mut self.state.lock().unwrap())
     }
 
+    /// Show `path` as the file being worked on. With several threads this
+    /// is simply the most recently started one.
+    fn set_current(&self, path: &Path) {
+        if let Some(p) = path.to_str() {
+            self.with(|s| {
+                s.current.clear();
+                s.current.push_str(p);
+            });
+        }
+    }
+
     fn problem(&self, path: &Path, message: String) {
         self.with(|s| {
             s.problem_count += 1;
@@ -283,6 +331,7 @@ impl Job {
             Job::Add { .. } | Job::AddNew { .. } => JobKind::Add,
             Job::Verify { .. } => JobKind::Verify,
             Job::Export { .. } => JobKind::Export,
+            Job::Benchmark { .. } => JobKind::Benchmark,
         }
     }
 }
@@ -338,9 +387,13 @@ fn run(sh: &Shared, db_path: &Path, job: Job) {
             Job::Update { ids } => run_update(sh, &db, &ids),
             Job::RemoveEntries { ids } => run_remove_entries(sh, &db, &ids),
             Job::RemoveRoot { root_id } => run_remove_root(sh, &mut db, root_id),
-            Job::Verify { target } => run_verify(sh, &mut db, target),
+            Job::Verify { target } => run_verify(sh, &mut db, db_path, target),
             Job::AddNew { new_file_ids, algo } => run_add_new(sh, &db, &new_file_ids, algo),
             Job::Export { run, format, dest } => run_export(sh, &db, db_path, run, format, dest),
+            Job::Benchmark {
+                inputs,
+                limit_bytes,
+            } => run_benchmark(sh, &db, &inputs, limit_bytes),
         });
     sh.with(|s| {
         if let Err(msg) = result {
@@ -375,6 +428,17 @@ impl<'a> Batch<'a> {
         }
     }
 
+    /// Make sure a transaction is open before writing.
+    fn begin(&mut self) -> Result<(), String> {
+        if !self.open {
+            self.db.begin().map_err(|e| e.to_string())?;
+            self.open = true;
+            self.writes = 0;
+            self.started = Instant::now();
+        }
+        Ok(())
+    }
+
     /// Wait out a pause (without holding the write lock), then make sure a
     /// transaction is open. Returns `false` if the job was cancelled.
     fn next(&mut self, sh: &Shared) -> Result<bool, String> {
@@ -384,12 +448,7 @@ impl<'a> Batch<'a> {
         if !sh.checkpoint() {
             return Ok(false);
         }
-        if !self.open {
-            self.db.begin().map_err(|e| e.to_string())?;
-            self.open = true;
-            self.writes = 0;
-            self.started = Instant::now();
-        }
+        self.begin()?;
         Ok(true)
     }
 
@@ -397,6 +456,15 @@ impl<'a> Batch<'a> {
     fn wrote(&mut self) -> Result<(), String> {
         self.writes += 1;
         if self.writes >= BATCH_FILES || self.started.elapsed() >= BATCH_TIME {
+            self.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Called when no result is waiting: never sit on the write lock while
+    /// paused, and do not let a quiet batch grow old.
+    fn idle(&mut self, sh: &Shared) -> Result<(), String> {
+        if self.open && (sh.is_paused() || self.started.elapsed() >= BATCH_TIME) {
             self.commit()?;
         }
         Ok(())
@@ -411,17 +479,227 @@ impl<'a> Batch<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-drive scheduling
+// ---------------------------------------------------------------------------
+
+/// Files at least this large are hashed with BLAKE3's multithreaded mode
+/// even when several files are being read in parallel.
+const BIG_FILE: u64 = 16 * 1024 * 1024;
+
+/// Results waiting for the database writer; workers block when it is full.
+const RESULT_QUEUE: usize = 4096;
+
+/// The work for one physical drive.
+struct Pool<T> {
+    plan: DrivePlan,
+    items: Mutex<std::vec::IntoIter<T>>,
+}
+
+/// What each worker thread owns.
+struct Ctx {
+    buf: ReadBuf,
+    /// The drive is read one file at a time.
+    sequential: bool,
+    direct: bool,
+    /// Read-only database connection, opened on first use (Verify).
+    db: Option<Db>,
+}
+
+/// Sorts work into one pool per physical drive, keeping its order.
+struct Grouper<'a, T> {
+    db: &'a Db,
+    detector: Detector,
+    /// volume root -> index into `pools`
+    by_volume: HashMap<String, usize>,
+    /// device key -> index into `pools`
+    by_device: HashMap<String, usize>,
+    pools: Vec<(DrivePlan, Vec<T>)>,
+}
+
+impl<'a, T> Grouper<'a, T> {
+    fn new(db: &'a Db) -> Grouper<'a, T> {
+        Grouper {
+            db,
+            detector: Detector::new(),
+            by_volume: HashMap::new(),
+            by_device: HashMap::new(),
+            pools: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, path: &str, item: T) -> DbResult<()> {
+        let volume = volume_root(path).unwrap_or("");
+        let index = match self.by_volume.get(volume) {
+            Some(i) => *i,
+            None => {
+                let info = self.detector.drive_of(path).clone();
+                let setting = drive_threads_setting(self.db, volume)?;
+                let threads = setting
+                    .unwrap_or_else(|| info.default_threads())
+                    .clamp(1, MAX_THREADS);
+                let key = info.device_key();
+                let index = match self.by_device.get(&key) {
+                    Some(i) => {
+                        // Two volumes on one device: honour the more careful setting.
+                        let plan = &mut self.pools[*i].0;
+                        plan.threads = plan.threads.min(threads);
+                        plan.overridden |= setting.is_some();
+                        *i
+                    }
+                    None => {
+                        self.pools.push((
+                            DrivePlan {
+                                info,
+                                threads,
+                                overridden: setting.is_some(),
+                            },
+                            Vec::new(),
+                        ));
+                        self.by_device.insert(key, self.pools.len() - 1);
+                        self.pools.len() - 1
+                    }
+                };
+                self.by_volume.insert(volume.to_string(), index);
+                index
+            }
+        };
+        self.pools[index].1.push(item);
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<Pool<T>> {
+        self.pools
+            .into_iter()
+            .map(|(plan, items)| Pool {
+                plan,
+                items: Mutex::new(items.into_iter()),
+            })
+            .collect()
+    }
+}
+
+/// Meta key holding the user's thread count for a volume.
+pub fn drive_threads_key(volume: &str) -> String {
+    format!("drive_threads:{volume}")
+}
+
+/// Meta key: "1" when reads should bypass the OS file cache.
+pub const DIRECT_IO_KEY: &str = "direct_io";
+
+fn drive_threads_setting(db: &Db, volume: &str) -> DbResult<Option<usize>> {
+    Ok(db
+        .meta(&drive_threads_key(volume))?
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1))
+}
+
+fn direct_io_setting(db: &Db) -> DbResult<bool> {
+    Ok(db.meta(DIRECT_IO_KEY)?.as_deref() == Some("1"))
+}
+
+/// Run every pool with its own threads, all drives at the same time.
+/// `work` runs on worker threads and returns `Ok(None)` when it was
+/// cancelled mid-item; `sink` runs on the calling thread (which owns the
+/// database connection) for every result; `idle` runs when nothing is
+/// waiting.
+fn run_pools<T: Send, R: Send>(
+    sh: &Shared,
+    pools: &[Pool<T>],
+    direct: bool,
+    work: &(dyn Fn(&mut Ctx, T) -> Result<Option<R>, String> + Sync),
+    sink: &mut dyn FnMut(R) -> Result<(), String>,
+    idle: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    sh.with(|s| s.plans = pools.iter().map(|p| p.plan.describe()).collect());
+    let failure: Mutex<Option<String>> = Mutex::new(None);
+    let stop = AtomicBool::new(false);
+    let mut outcome = Ok(());
+    std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<R>(RESULT_QUEUE);
+        for pool in pools {
+            for _ in 0..pool.plan.threads.max(1) {
+                let tx = tx.clone();
+                let (failure, stop) = (&failure, &stop);
+                scope.spawn(move || {
+                    let mut ctx = Ctx {
+                        buf: ReadBuf::new(),
+                        sequential: pool.plan.sequential(),
+                        direct,
+                        db: None,
+                    };
+                    loop {
+                        if stop.load(Ordering::Relaxed) || !sh.checkpoint() {
+                            break;
+                        }
+                        let Some(item) = pool.items.lock().unwrap().next() else {
+                            break;
+                        };
+                        match work(&mut ctx, item) {
+                            Ok(Some(result)) => {
+                                if tx.send(result).is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(msg) => {
+                                failure.lock().unwrap().get_or_insert(msg);
+                                stop.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        }
+        drop(tx);
+        loop {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(result) => {
+                    if let Err(e) = sink(result) {
+                        outcome = Err(e);
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Err(e) = idle() {
+                        outcome = Err(e);
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        // On an error, release the workers: stop them and unblock any that
+        // is waiting to hand over a result.
+        stop.store(true, Ordering::Relaxed);
+        drop(rx);
+    });
+    outcome?;
+    match failure.into_inner().unwrap() {
+        Some(msg) => Err(msg),
+        None => Ok(()),
+    }
+}
+
 /// Hash one file with progress, pause and cancel, keeping the byte counter
 /// aligned with `planned_size` whatever happens.
 fn hash_one(
     sh: &Shared,
-    buf: &mut Vec<u8>,
+    ctx: &mut Ctx,
     path: &Path,
     algo: Algo,
     planned_size: u64,
 ) -> std::io::Result<HashOutcome> {
+    sh.set_current(path);
+    let opts = HashOpts {
+        // One file at a time: give BLAKE3 all the cores. Many files at
+        // once: only large files are worth splitting further.
+        parallel: ctx.sequential || planned_size >= BIG_FILE,
+        direct: ctx.direct,
+    };
     let mut read: u64 = 0;
-    let outcome = hash_file(path, algo, buf, true, &mut |n| {
+    let outcome = hash_file(path, algo, &mut ctx.buf, opts, &mut |n| {
         read += n;
         sh.bytes_done.fetch_add(n, Ordering::Relaxed);
         sh.checkpoint()
@@ -448,51 +726,93 @@ struct Item {
     algo: Algo,
 }
 
-/// Hash `items` one after another, handing each finished hash to `store`
-/// inside batched transactions.
+/// What a worker reports for an [`Item`].
+enum Hashed<'a> {
+    Done {
+        item: &'a Item,
+        hash: Vec<u8>,
+        size: u64,
+        mtime_ns: i64,
+    },
+    ChangedDuringHash(&'a Item),
+    Failed(&'a Item, std::io::Error),
+}
+
+/// Hash `items`, each drive with its own threads, handing every finished
+/// hash to `store` (on this thread) inside batched transactions.
 fn hash_items(
     sh: &Shared,
     db: &Db,
     items: &[Item],
     store: &mut dyn FnMut(&Item, &[u8], u64, i64) -> DbResult<()>,
 ) -> Result<(), String> {
+    let mut grouper = Grouper::new(db);
+    for item in items {
+        grouper.push(&item.path, item).map_err(|e| e.to_string())?;
+    }
+    let pools = grouper.finish();
+    let direct = direct_io_setting(db).map_err(|e| e.to_string())?;
     sh.with(|s| {
         s.phase = Phase::Hashing;
         s.hashing_started = Some(Instant::now());
         s.files_total = items.len() as u64;
         s.bytes_total = items.iter().map(|p| p.size).sum();
     });
-    let mut buf = Vec::new();
-    let mut batch = Batch::new(db);
-    for p in items {
-        if !batch.next(sh)? {
-            break;
-        }
-        sh.with(|s| s.current.clone_from(&p.path));
-        let path = Path::new(&p.path);
-        match hash_one(sh, &mut buf, path, p.algo, p.size) {
-            Ok(HashOutcome::Done {
-                hash,
-                size,
-                mtime_ns,
-            }) => {
-                store(p, &hash, size, mtime_ns).map_err(|e| e.to_string())?;
-                batch.wrote()?;
+    let batch = std::cell::RefCell::new(Batch::new(db));
+    let result = run_pools(
+        sh,
+        &pools,
+        direct,
+        &|ctx, item: &Item| {
+            Ok(
+                match hash_one(sh, ctx, Path::new(&item.path), item.algo, item.size) {
+                    Ok(HashOutcome::Done {
+                        hash,
+                        size,
+                        mtime_ns,
+                    }) => Some(Hashed::Done {
+                        item,
+                        hash,
+                        size,
+                        mtime_ns,
+                    }),
+                    Ok(HashOutcome::ChangedDuringHash) => Some(Hashed::ChangedDuringHash(item)),
+                    Ok(HashOutcome::Cancelled) => None,
+                    Err(e) => Some(Hashed::Failed(item, e)),
+                },
+            )
+        },
+        &mut |hashed| {
+            match hashed {
+                Hashed::Done {
+                    item,
+                    hash,
+                    size,
+                    mtime_ns,
+                } => {
+                    let mut batch = batch.borrow_mut();
+                    batch.begin()?;
+                    store(item, &hash, size, mtime_ns).map_err(|e| e.to_string())?;
+                    batch.wrote()?;
+                }
+                Hashed::ChangedDuringHash(item) => {
+                    sh.with(|s| s.changed_during_hash += 1);
+                    sh.problem(
+                        Path::new(&item.path),
+                        "changed while it was being hashed; result discarded, try again later"
+                            .into(),
+                    );
+                }
+                Hashed::Failed(item, e) => sh.problem(Path::new(&item.path), e.to_string()),
             }
-            Ok(HashOutcome::ChangedDuringHash) => {
-                sh.with(|s| s.changed_during_hash += 1);
-                sh.problem(
-                    path,
-                    "changed while it was being hashed; result discarded, try again later".into(),
-                );
-            }
-            Ok(HashOutcome::Cancelled) => break,
-            Err(e) => sh.problem(path, e.to_string()),
-        }
-        sh.with(|s| s.files_done += 1);
-    }
-    // Cancelled or complete: keep everything hashed so far.
-    batch.commit()
+            sh.with(|s| s.files_done += 1);
+            Ok(())
+        },
+        &mut || batch.borrow_mut().idle(sh),
+    );
+    // Cancelled, failed or complete: keep everything hashed so far.
+    batch.into_inner().commit()?;
+    result
 }
 
 fn run_add(
@@ -644,7 +964,144 @@ impl Volumes {
     }
 }
 
-fn run_verify(sh: &Shared, db: &mut Db, target: VerifyTarget) -> Result<(), String> {
+/// What a worker found out about one entry.
+struct Checked {
+    id: i64,
+    finding: Finding,
+}
+
+enum Finding {
+    /// The entry was removed while the job ran.
+    Gone,
+    /// The file changed while being read; reported as a problem, record untouched.
+    Undecided,
+    /// Its drive is not connected; record untouched.
+    Unavailable,
+    Ok {
+        size: u64,
+        mtime_ns: i64,
+    },
+    Problem(Status, String),
+}
+
+/// Verify one entry on a worker thread: look, re-hash, classify. Writes
+/// nothing; the result goes back to the thread that owns the database.
+fn verify_one(
+    sh: &Shared,
+    ctx: &mut Ctx,
+    db_path: &Path,
+    id: i64,
+    volumes: &Mutex<Volumes>,
+) -> Result<Option<Checked>, String> {
+    if ctx.db.is_none() {
+        ctx.db = Some(Db::open(db_path).map_err(|e| e.to_string())?);
+    }
+    let db = ctx.db.as_ref().expect("just opened");
+    let Some(entry) = db.entry(id).map_err(|e| e.to_string())? else {
+        return Ok(Some(Checked {
+            id,
+            finding: Finding::Gone,
+        }));
+    };
+    let path = Path::new(&entry.path);
+    let skip_bytes = || {
+        sh.bytes_done.fetch_add(entry.size, Ordering::Relaxed);
+    };
+    let missing = || Finding::Problem(Status::Missing, "the file no longer exists".into());
+
+    let finding = match fsread::stat(path) {
+        Err(err) => {
+            skip_bytes();
+            let mut vols = volumes.lock().unwrap();
+            if !vols.is_available(&entry.path) {
+                vols.note_skipped(&entry.path, 1);
+                Finding::Unavailable
+            } else if err.kind() == std::io::ErrorKind::NotFound {
+                missing()
+            } else {
+                Finding::Problem(Status::Unreadable, err.to_string())
+            }
+        }
+        Ok(meta) if meta.kind != Kind::File => {
+            skip_bytes();
+            Finding::Problem(
+                Status::Unreadable,
+                "this is no longer a regular file".into(),
+            )
+        }
+        Ok(_) => match hash_one(sh, ctx, path, entry.algo, entry.size) {
+            Ok(HashOutcome::Done {
+                hash,
+                size,
+                mtime_ns,
+            }) => {
+                let stored = Fingerprint {
+                    hash: &entry.hash,
+                    size: entry.size,
+                    mtime_ns: entry.mtime_ns,
+                };
+                let current = Fingerprint {
+                    hash: &hash,
+                    size,
+                    mtime_ns,
+                };
+                match classify(stored, current) {
+                    Verdict::Ok => Finding::Ok { size, mtime_ns },
+                    Verdict::Changed {
+                        size_differs,
+                        mtime_differs,
+                    } => {
+                        let mut what = Vec::new();
+                        if size_differs {
+                            what.push(format!("size {} -> {} bytes", entry.size, size));
+                        }
+                        if mtime_differs {
+                            what.push(format!(
+                                "modified {} -> {}",
+                                crate::util::format_unix_nanos(entry.mtime_ns),
+                                crate::util::format_unix_nanos(mtime_ns)
+                            ));
+                        }
+                        Finding::Problem(
+                            Status::Changed,
+                            format!("content differs; {}", what.join(", ")),
+                        )
+                    }
+                    Verdict::PossiblyCorrupted => Finding::Problem(
+                        Status::PossiblyCorrupted,
+                        format!(
+                            "content differs although size and modified time are unchanged; current {} {}",
+                            entry.algo.name(),
+                            crate::hasher::to_hex(&hash)
+                        ),
+                    ),
+                }
+            }
+            Ok(HashOutcome::ChangedDuringHash) => {
+                sh.with(|s| s.changed_during_hash += 1);
+                sh.problem(
+                    path,
+                    "changed while it was being verified; result discarded, verify it again later"
+                        .into(),
+                );
+                Finding::Undecided
+            }
+            Ok(HashOutcome::Cancelled) => return Ok(None),
+            // The file was there a moment ago.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => missing(),
+            // A read error on a file that used to be fine is itself a warning sign.
+            Err(err) => Finding::Problem(Status::Unreadable, err.to_string()),
+        },
+    };
+    Ok(Some(Checked { id, finding }))
+}
+
+fn run_verify(
+    sh: &Shared,
+    db: &mut Db,
+    db_path: &Path,
+    target: VerifyTarget,
+) -> Result<(), String> {
     let e = |e: crate::db::DbError| e.to_string();
     let run = db.begin_run().map_err(e)?;
     sh.with(|s| s.run_id = run);
@@ -752,144 +1209,68 @@ fn run_verify(sh: &Shared, db: &mut Db, target: VerifyTarget) -> Result<(), Stri
     }
     batch.commit()?;
 
-    // 2. Re-hash every entry and compare.
+    // 2. Re-hash every entry and compare, each drive with its own threads.
+    let mut grouper = Grouper::new(db);
+    for id in &ids {
+        // Entries removed in the meantime are simply skipped.
+        if let Some(path) = db.path_of(*id).map_err(e)? {
+            grouper.push(&path, *id).map_err(e)?;
+        }
+    }
+    let pools = grouper.finish();
+    let direct = direct_io_setting(db).map_err(e)?;
     sh.with(|s| {
         s.phase = Phase::Hashing;
         s.hashing_started = Some(Instant::now());
-        s.files_total = ids.len() as u64;
+        s.files_total = pools
+            .iter()
+            .map(|p| p.items.lock().unwrap().len() as u64)
+            .sum();
         s.bytes_total = bytes_total;
     });
-    let mut buf = Vec::new();
-    let mut completed = true;
-    for id in &ids {
-        if !batch.next(sh)? {
-            completed = false;
-            break;
-        }
-        // Entries removed in the meantime are simply skipped.
-        let Some(entry) = db.entry(*id).map_err(e)? else {
+    let volumes = Mutex::new(volumes);
+    let batch = std::cell::RefCell::new(batch);
+    let result = run_pools(
+        sh,
+        &pools,
+        direct,
+        &|ctx, id: i64| verify_one(sh, ctx, db_path, id, &volumes),
+        &mut |checked: Checked| {
+            let now = now_unix();
+            let mut batch = batch.borrow_mut();
+            match checked.finding {
+                Finding::Gone | Finding::Undecided => {}
+                Finding::Unavailable => sh.with(|s| s.verify.unavailable += 1),
+                Finding::Ok { size, mtime_ns } => {
+                    batch.begin()?;
+                    db.record_verified_ok(checked.id, size, mtime_ns, now, run)
+                        .map_err(e)?;
+                    batch.wrote()?;
+                    sh.with(|s| s.verify.ok += 1);
+                }
+                Finding::Problem(status, detail) => {
+                    batch.begin()?;
+                    db.record_verified_problem(checked.id, status, &detail, now, run)
+                        .map_err(e)?;
+                    batch.wrote()?;
+                    sh.with(|s| match status {
+                        Status::Changed => s.verify.changed += 1,
+                        Status::PossiblyCorrupted => s.verify.possibly_corrupted += 1,
+                        Status::Missing => s.verify.missing += 1,
+                        Status::Unreadable => s.verify.unreadable += 1,
+                        Status::Ok => {}
+                    });
+                }
+            }
             sh.with(|s| s.files_done += 1);
-            continue;
-        };
-        sh.with(|s| s.current.clone_from(&entry.path));
-        let path = Path::new(&entry.path);
-        let skip_bytes = || {
-            sh.bytes_done.fetch_add(entry.size, Ordering::Relaxed);
-        };
-
-        // (status, detail) to record, or None to leave the entry untouched.
-        let mut finding: Option<(Status, String)> = None;
-        let mut ok: Option<(u64, i64)> = None;
-        match fsread::stat(path) {
-            Err(err) => {
-                skip_bytes();
-                if !volumes.is_available(&entry.path) {
-                    volumes.note_skipped(&entry.path, 1);
-                    sh.with(|s| s.verify.unavailable += 1);
-                } else if err.kind() == std::io::ErrorKind::NotFound {
-                    finding = Some((Status::Missing, "the file no longer exists".into()));
-                } else {
-                    finding = Some((Status::Unreadable, err.to_string()));
-                }
-            }
-            Ok(meta) if meta.kind != Kind::File => {
-                skip_bytes();
-                finding = Some((
-                    Status::Unreadable,
-                    "this is no longer a regular file".into(),
-                ));
-            }
-            Ok(_) => match hash_one(sh, &mut buf, path, entry.algo, entry.size) {
-                Ok(HashOutcome::Done {
-                    hash,
-                    size,
-                    mtime_ns,
-                }) => {
-                    let stored = Fingerprint {
-                        hash: &entry.hash,
-                        size: entry.size,
-                        mtime_ns: entry.mtime_ns,
-                    };
-                    let current = Fingerprint {
-                        hash: &hash,
-                        size,
-                        mtime_ns,
-                    };
-                    match classify(stored, current) {
-                        Verdict::Ok => ok = Some((size, mtime_ns)),
-                        Verdict::Changed {
-                            size_differs,
-                            mtime_differs,
-                        } => {
-                            let mut what = Vec::new();
-                            if size_differs {
-                                what.push(format!("size {} -> {} bytes", entry.size, size));
-                            }
-                            if mtime_differs {
-                                what.push(format!(
-                                    "modified {} -> {}",
-                                    crate::util::format_unix_nanos(entry.mtime_ns),
-                                    crate::util::format_unix_nanos(mtime_ns)
-                                ));
-                            }
-                            finding = Some((
-                                Status::Changed,
-                                format!("content differs; {}", what.join(", ")),
-                            ));
-                        }
-                        Verdict::PossiblyCorrupted => {
-                            finding = Some((
-                                Status::PossiblyCorrupted,
-                                format!(
-                                    "content differs although size and modified time are unchanged; current {} {}",
-                                    entry.algo.name(),
-                                    crate::hasher::to_hex(&hash)
-                                ),
-                            ));
-                        }
-                    }
-                }
-                Ok(HashOutcome::ChangedDuringHash) => {
-                    sh.with(|s| s.changed_during_hash += 1);
-                    sh.problem(
-                        path,
-                        "changed while it was being verified; result discarded, verify it again later".into(),
-                    );
-                }
-                Ok(HashOutcome::Cancelled) => {
-                    completed = false;
-                    break;
-                }
-                // The file was there a moment ago: a read error on a file
-                // that used to be fine is itself a warning sign.
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    finding = Some((Status::Missing, "the file no longer exists".into()));
-                }
-                Err(err) => finding = Some((Status::Unreadable, err.to_string())),
-            },
-        }
-
-        let now = now_unix();
-        if let Some((size, mtime_ns)) = ok {
-            db.record_verified_ok(entry.id, size, mtime_ns, now, run)
-                .map_err(e)?;
-            sh.with(|s| s.verify.ok += 1);
-            batch.wrote()?;
-        } else if let Some((status, detail)) = finding {
-            db.record_verified_problem(entry.id, status, &detail, now, run)
-                .map_err(e)?;
-            sh.with(|s| match status {
-                Status::Changed => s.verify.changed += 1,
-                Status::PossiblyCorrupted => s.verify.possibly_corrupted += 1,
-                Status::Missing => s.verify.missing += 1,
-                Status::Unreadable => s.verify.unreadable += 1,
-                Status::Ok => {}
-            });
-            batch.wrote()?;
-        }
-        sh.with(|s| s.files_done += 1);
-    }
-    batch.commit()?;
+            Ok(())
+        },
+        &mut || batch.borrow_mut().idle(sh),
+    );
+    batch.into_inner().commit()?;
+    result?;
+    let volumes = volumes.into_inner().unwrap();
+    let completed = !sh.cancelled();
 
     let unavailable: String = volumes
         .skipped
@@ -912,6 +1293,185 @@ fn run_verify(sh: &Shared, db: &mut Db, target: VerifyTarget) -> Result<(), Stri
     db.set_meta(report::meta::UNAVAILABLE, &unavailable)
         .map_err(e)?;
     db.commit().map_err(e)?;
+    Ok(())
+}
+
+/// Amount of in-memory data hashed per algorithm for the CPU-only figures.
+const BENCH_MEMORY_BLOCK: usize = 64 * 1024 * 1024;
+const BENCH_MEMORY_ROUNDS: usize = 16;
+
+/// Measure how fast existing files can be read and hashed. Nothing is
+/// stored in the database and nothing is written anywhere.
+fn run_benchmark(sh: &Shared, db: &Db, inputs: &[PathBuf], limit_bytes: u64) -> Result<(), String> {
+    // 1. Pick the files: in path order until the size limit is reached.
+    let mut items: Vec<Item> = Vec::new();
+    let mut total: u64 = 0;
+    let full = |total: u64| limit_bytes > 0 && total >= limit_bytes;
+    for input in inputs {
+        if full(total) || !sh.checkpoint() {
+            break;
+        }
+        let Ok(resolved) = fsread::resolve(input) else {
+            sh.problem(input, "cannot be opened".into());
+            continue;
+        };
+        match fsread::stat(&resolved).map(|m| (m.kind, m.size)) {
+            Ok((Kind::File, size)) => {
+                if let Some(p) = resolved.to_str() {
+                    items.push(Item {
+                        id: None,
+                        path: p.to_string(),
+                        size,
+                        root_id: None,
+                        algo: Algo::Blake3,
+                    });
+                    total += size;
+                }
+            }
+            Ok((Kind::Dir, _)) => fsread::walk(&resolved, true, &mut |item| {
+                if let WalkItem::File { path, meta } = item
+                    && meta.size > 0
+                    && let Some(p) = path.to_str()
+                {
+                    items.push(Item {
+                        id: None,
+                        path: p.to_string(),
+                        size: meta.size,
+                        root_id: None,
+                        algo: Algo::Blake3,
+                    });
+                    total += meta.size;
+                }
+                !full(total) && !sh.cancelled()
+            }),
+            _ => sh.problem(&resolved, "not a regular file or folder".into()),
+        }
+    }
+    if sh.cancelled() {
+        return Ok(());
+    }
+    if items.is_empty() || total == 0 {
+        return Err("no readable files were selected for the benchmark".into());
+    }
+
+    let disk_passes: [(&str, Algo, bool); 4] = [
+        ("BLAKE3, direct reads", Algo::Blake3, true),
+        ("XXH3-128, direct reads", Algo::Xxh3_128, true),
+        ("SHA-256, direct reads", Algo::Sha256, true),
+        (
+            "BLAKE3, normal reads (may be served from the file cache)",
+            Algo::Blake3,
+            false,
+        ),
+    ];
+    sh.with(|s| {
+        s.phase = Phase::Hashing;
+        s.hashing_started = Some(Instant::now());
+        s.files_total = (items.len() * disk_passes.len()) as u64;
+        s.bytes_total = total * disk_passes.len() as u64;
+    });
+
+    // 2. Read and hash the files once per algorithm.
+    for (label, algo, direct) in disk_passes {
+        if !sh.checkpoint() {
+            return Ok(());
+        }
+        sh.with(|s| s.bench_step = label.to_string());
+        let mut grouper = Grouper::new(db);
+        for item in &items {
+            grouper.push(&item.path, item).map_err(|e| e.to_string())?;
+        }
+        let pools = grouper.finish();
+        let plans: Vec<String> = pools.iter().map(|p| p.plan.describe()).collect();
+        let mut bytes = 0u64;
+        let started = Instant::now();
+        let paused_before = sh.snapshot().paused_total;
+        run_pools(
+            sh,
+            &pools,
+            direct,
+            &|ctx, item: &Item| {
+                Ok(
+                    match hash_one(sh, ctx, Path::new(&item.path), algo, item.size) {
+                        Ok(HashOutcome::Done { size, .. }) => Some(Ok(size)),
+                        Ok(HashOutcome::ChangedDuringHash) => Some(Ok(0)),
+                        Ok(HashOutcome::Cancelled) => None,
+                        Err(e) => Some(Err((item.path.clone(), e.to_string()))),
+                    },
+                )
+            },
+            &mut |r: Result<u64, (String, String)>| {
+                match r {
+                    Ok(n) => bytes += n,
+                    Err((path, e)) => sh.problem(Path::new(&path), e),
+                }
+                sh.with(|s| s.files_done += 1);
+                Ok(())
+            },
+            &mut || Ok(()),
+        )?;
+        if sh.cancelled() {
+            return Ok(());
+        }
+        let paused = sh.snapshot().paused_total.saturating_sub(paused_before);
+        let secs = started.elapsed().saturating_sub(paused).as_secs_f64();
+        sh.with(|s| {
+            if s.bench_info.is_empty() {
+                s.bench_info = format!(
+                    "{} files, {} MB · {} · {} logical CPUs · hash-check {}",
+                    items.len(),
+                    total / 1_048_576,
+                    plans.join("; "),
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(0),
+                    crate::VERSION
+                );
+            }
+            s.bench.push(BenchRow {
+                label: label.to_string(),
+                bytes,
+                secs,
+            });
+        });
+    }
+
+    // 3. The same algorithms on data already in memory: what the CPU alone can do.
+    let block: Vec<u8> = (0..BENCH_MEMORY_BLOCK)
+        .map(|i| (i.wrapping_mul(31) ^ (i >> 7)) as u8)
+        .collect();
+    let memory_passes: [(&str, Algo, bool); 4] = [
+        ("BLAKE3, in memory, all cores", Algo::Blake3, true),
+        ("BLAKE3, in memory, 1 thread", Algo::Blake3, false),
+        ("XXH3-128, in memory, 1 thread", Algo::Xxh3_128, false),
+        ("SHA-256, in memory, 1 thread", Algo::Sha256, false),
+    ];
+    for (label, algo, parallel) in memory_passes {
+        sh.with(|s| {
+            s.bench_step = label.to_string();
+            s.current.clear();
+        });
+        let mut hasher = crate::hasher::Hasher::new(algo);
+        let started = Instant::now();
+        let mut bytes = 0u64;
+        for _ in 0..BENCH_MEMORY_ROUNDS {
+            if sh.cancelled() {
+                return Ok(());
+            }
+            hasher.update(&block, parallel);
+            bytes += block.len() as u64;
+        }
+        let _ = hasher.finalize();
+        let secs = started.elapsed().as_secs_f64();
+        sh.with(|s| {
+            s.bench.push(BenchRow {
+                label: label.to_string(),
+                bytes,
+                secs,
+            })
+        });
+    }
+    sh.with(|s| s.bench_step.clear());
     Ok(())
 }
 

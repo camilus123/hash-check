@@ -392,6 +392,41 @@ impl Db {
         Ok(n == 1)
     }
 
+    /// Volumes (such as `L:\\`) that hold tracked files.
+    pub fn volumes(&self) -> DbResult<Vec<String>> {
+        let mut out: Vec<String> = Vec::new();
+        let mut add = |path: &str| {
+            if let Some(v) = crate::verify::volume_root(path)
+                && !out.iter().any(|o| o.eq_ignore_ascii_case(v))
+            {
+                out.push(v.to_string());
+            }
+        };
+        for root in self.roots()? {
+            add(&root.path);
+        }
+        // Single files: one representative path per distinct 3-character prefix.
+        let mut st = self.conn.prepare_cached(
+            "SELECT MIN(path) FROM files WHERE root_id IS NULL GROUP BY substr(path, 1, 3)",
+        )?;
+        let rows = st.query_map([], |r| r.get::<_, Option<String>>(0))?;
+        for path in rows {
+            if let Some(path) = path? {
+                add(&path);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Path of an entry, if it still exists.
+    pub fn path_of(&self, id: i64) -> DbResult<Option<String>> {
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT path FROM files WHERE id = ?1")?;
+        Ok(st.query_row(params![id], |r| r.get(0)).optional()?)
+    }
+
     pub fn count_files(&self) -> DbResult<u64> {
         let n: i64 = self
             .conn
