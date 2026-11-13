@@ -8,7 +8,7 @@ time do not).
 Primary target: Windows 11 x64. The code also builds and passes its tests
 on Linux.
 
-> **Status: 0.4.0, fourth milestone.** All features are in place. What is
+> **Status: 0.4.1, fourth milestone.** All features are in place. What is
 > left for 1.0.0 is a robustness pass and real benchmark numbers (see
 > [Roadmap](#roadmap)).
 

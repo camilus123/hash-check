@@ -4,6 +4,14 @@ Versions are `x.y.z`: `x` for major changes, `y` for added features, `z` for
 bug fixes. `1.0.0` will be the first release that meets the whole project
 brief.
 
+## 0.4.1 (2026-11-13)
+
+### Fixed
+- Nothing was ever copied to the clipboard: "Copy as Markdown" in the
+  benchmark window, "Copy full path", "Copy hash" and "Copy path" all did
+  nothing, because clipboard support had been left out of the build.
+- For the same reason the link in the About box did not open.
+
 ## 0.4.0 (2026-11-13)
 
 Fourth milestone: performance.
