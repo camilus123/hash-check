@@ -3,8 +3,10 @@
 
 use crate::appdata::AppDir;
 use crate::db::{Db, Entry, Filter, NewFile, Root, Scope, Status, StatusCounts};
+use crate::drives::{Detector, DriveInfo, MAX_THREADS};
 use crate::engine::{
-    self, ExportDest, Job, JobKind, Phase, Shared, State, VerifyCounts, VerifyTarget,
+    self, BenchRow, DIRECT_IO_KEY, ExportDest, Job, JobKind, Phase, Shared, State, VerifyCounts,
+    VerifyTarget, drive_threads_key,
 };
 use crate::hasher::{Algo, to_hex};
 use crate::report::Format;
@@ -104,6 +106,12 @@ struct VerifySummary {
     changed_during: u64,
 }
 
+/// The "Benchmark" dialog.
+struct BenchDialog {
+    inputs: Vec<PathBuf>,
+    limit_gb: u32,
+}
+
 /// The "Export report" dialog.
 struct ExportDialog {
     format: Format,
@@ -152,6 +160,15 @@ struct App {
     verify_summary: Option<VerifySummary>,
     export: Option<ExportDialog>,
     info: Option<String>,
+
+    // Performance settings and benchmark.
+    detector: Detector,
+    /// Tracked volumes with their detected kind and the user's thread setting.
+    drives: Vec<(DriveInfo, Option<usize>)>,
+    direct_io: bool,
+    bench_dialog: Option<BenchDialog>,
+    /// Results of the last benchmark, shown until closed.
+    bench_result: Option<(String, Vec<BenchRow>, bool)>,
 
     // Overview for the left panel.
     roots: Vec<Root>,
@@ -205,6 +222,11 @@ impl App {
             verify_summary: None,
             export: None,
             info: None,
+            detector: Detector::new(),
+            drives: Vec::new(),
+            direct_io: false,
+            bench_dialog: None,
+            bench_result: None,
             roots: Vec::new(),
             root_counts: HashMap::new(),
             loose_count: 0,
@@ -295,6 +317,7 @@ impl App {
                 self.counts = counts;
                 self.new_count = new_count;
                 self.corrupted_total = corrupted;
+                self.refresh_settings();
                 self.last_run = last_run;
                 self.cache.clear();
                 self.new_cache.clear();
@@ -302,6 +325,32 @@ impl App {
             Err(e) => self.error = Some(e.to_string()),
         }
         self.last_list_refresh = Instant::now();
+    }
+
+    /// Reload the drive list and performance settings.
+    fn refresh_settings(&mut self) {
+        let loaded = (|| {
+            let mut drives = Vec::new();
+            for volume in self.db.volumes()? {
+                let setting = self
+                    .db
+                    .meta(&drive_threads_key(&volume))?
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|n| *n >= 1);
+                drives.push((self.detector.drive_of(&volume).clone(), setting));
+            }
+            Ok::<_, crate::db::DbError>((
+                drives,
+                self.db.meta(DIRECT_IO_KEY)?.as_deref() == Some("1"),
+            ))
+        })();
+        match loaded {
+            Ok((drives, direct)) => {
+                self.drives = drives;
+                self.direct_io = direct;
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
     }
 
     fn set_show(&mut self, show: Show) {
@@ -399,6 +448,13 @@ impl App {
                     changed_during: state.changed_during_hash,
                 });
                 self.corrupted_banner_dismissed = false;
+            }
+            if state.kind == JobKind::Benchmark && !state.bench.is_empty() {
+                self.bench_result = Some((
+                    state.bench_info.clone(),
+                    state.bench.clone(),
+                    state.cancelled,
+                ));
             }
             if state.kind == JobKind::Export
                 && state.fatal.is_none()
@@ -524,6 +580,44 @@ impl App {
                 self.confirm = Some(Confirm::RemoveEntries { ids: self.selected_ids() });
             }
             ui.separator();
+            ui.menu_button("Tools ▾", |ui| {
+                ui.set_min_width(300.0);
+                if ui
+                    .add_enabled(idle, egui::Button::new("Benchmark…"))
+                    .on_hover_text("Measure how fast each algorithm reads and hashes files on a drive. Read-only.")
+                    .clicked()
+                {
+                    self.bench_dialog = Some(BenchDialog {
+                        // Debug builds only: lets automated UI tests skip the native file dialog.
+                        inputs: if cfg!(debug_assertions) {
+                            std::env::var_os("HASH_CHECK_DEBUG_BENCH").map(PathBuf::from).into_iter().collect()
+                        } else {
+                            Vec::new()
+                        },
+                        limit_gb: 8,
+                    });
+                    ui.close();
+                }
+                if self.bench_result.is_none()
+                    && let Some(last) = self.last_job.as_ref().filter(|s| !s.bench.is_empty())
+                    && ui.button("Show last benchmark").clicked()
+                {
+                    self.bench_result = Some((last.bench_info.clone(), last.bench.clone(), last.cancelled));
+                    ui.close();
+                }
+                ui.separator();
+                let mut direct = self.direct_io;
+                if ui
+                    .add_enabled(idle, egui::Checkbox::new(&mut direct, "Read past the file cache (direct I/O)"))
+                    .on_hover_text(DIRECT_IO_HELP)
+                    .changed()
+                {
+                    match self.db.set_meta(DIRECT_IO_KEY, if direct { "1" } else { "0" }) {
+                        Ok(()) => self.direct_io = direct,
+                        Err(e) => self.error = Some(e.to_string()),
+                    }
+                }
+            });
             if ui.button("About").clicked() {
                 self.show_about = true;
             }
@@ -603,6 +697,71 @@ impl App {
         if let Some((root, entries)) = remove_root {
             self.confirm = Some(Confirm::RemoveRoot { root, entries });
         }
+        self.drives_panel(ui);
+    }
+
+    /// Per-drive thread settings.
+    fn drives_panel(&mut self, ui: &mut egui::Ui) {
+        if self.drives.is_empty() {
+            return;
+        }
+        let idle = self.job.is_none();
+        ui.add_space(10.0);
+        ui.separator();
+        ui.strong("Drives").on_hover_text(DRIVES_HELP);
+        ui.add_space(2.0);
+        let mut change: Option<(String, Option<usize>)> = None;
+        for (info, setting) in &self.drives {
+            let auto = info.default_threads();
+            let mut hover = format!("{} {}", info.volume, info.kind_label());
+            if let Some(model) = &info.model {
+                hover += &format!("\n{model}");
+            }
+            if let Some(disk) = info.disk {
+                hover += &format!("\nPhysical disk {disk}");
+            }
+            ui.label(format!("{} {}", info.volume, info.kind_label()))
+                .on_hover_text(hover);
+            let text = |n: usize| {
+                if n == 1 {
+                    "1 file at a time".to_string()
+                } else {
+                    format!("{n} files in parallel")
+                }
+            };
+            let selected = match setting {
+                Some(n) => text(*n),
+                None => format!("Auto: {}", text(auto)),
+            };
+            ui.add_enabled_ui(idle, |ui| {
+                egui::ComboBox::from_id_salt(("threads", &info.volume))
+                    .selected_text(selected)
+                    .width(200.0)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(setting.is_none(), format!("Auto: {}", text(auto)))
+                            .clicked()
+                        {
+                            change = Some((info.volume.clone(), None));
+                        }
+                        for n in [1usize, 2, 4, 8, 12, 16, 24, 32, MAX_THREADS] {
+                            if ui.selectable_label(*setting == Some(n), text(n)).clicked() {
+                                change = Some((info.volume.clone(), Some(n)));
+                            }
+                        }
+                    });
+            });
+            ui.add_space(4.0);
+        }
+        if let Some((volume, value)) = change {
+            let text = value
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "auto".to_string());
+            if let Err(e) = self.db.set_meta(&drive_threads_key(&volume), &text) {
+                self.error = Some(e.to_string());
+            }
+            self.refresh_settings();
+        }
     }
 
     // ------------------------------------------------------------ bottom panel
@@ -620,6 +779,8 @@ impl App {
                     (JobKind::Update, Phase::Preparing) => "Preparing update…",
                     (JobKind::Update, _) => "Updating: re-hashing…",
                     (JobKind::Remove, _) => "Removing…",
+                    (JobKind::Benchmark, Phase::Preparing) => "Benchmark: choosing files…",
+                    (JobKind::Benchmark, _) => "Benchmark running…",
                 };
                 ui.strong(if s.paused { "Paused" } else { what });
                 if let Some(job) = &self.job {
@@ -721,11 +882,22 @@ impl App {
                     }
                 }
             }
+            if !s.bench_step.is_empty() {
+                ui.label(format!("Measuring: {}", s.bench_step));
+            }
             ui.add(
                 egui::Label::new(egui::RichText::new(&s.current).weak())
                     .truncate()
                     .show_tooltip_when_elided(false),
             );
+            if !s.plans.is_empty() && s.phase == Phase::Hashing {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(s.plans.join("  ·  ")).weak().small())
+                        .truncate()
+                        .show_tooltip_when_elided(false),
+                )
+                .on_hover_text(s.plans.join("\n"));
+            }
             return;
         }
 
@@ -1488,6 +1660,142 @@ impl App {
         }
     }
 
+    fn bench_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.bench_dialog else {
+            return;
+        };
+        let mut start = false;
+        let mut cancel = false;
+        let modal = egui::Modal::new(egui::Id::unique("bench")).show(ctx, |ui| {
+            ui.set_max_width(540.0);
+            ui.heading("Benchmark");
+            ui.add_space(6.0);
+            ui.label(BENCH_HELP_1);
+            ui.add_space(6.0);
+            ui.label(BENCH_HELP_2);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Choose folder…").clicked()
+                    && let Some(dirs) = rfd::FileDialog::new()
+                        .set_title("Folder to benchmark")
+                        .pick_folders()
+                {
+                    dialog.inputs = dirs;
+                }
+                if ui.button("Choose files…").clicked()
+                    && let Some(files) = rfd::FileDialog::new()
+                        .set_title("Files to benchmark")
+                        .pick_files()
+                {
+                    dialog.inputs = files;
+                }
+            });
+            match dialog.inputs.as_slice() {
+                [] => {
+                    ui.weak("Nothing chosen yet.");
+                }
+                [one] => {
+                    ui.monospace(one.display().to_string());
+                }
+                [first, rest @ ..] => {
+                    ui.monospace(format!("{} and {} more", first.display(), rest.len()));
+                }
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Read at most");
+                ui.add(
+                    egui::DragValue::new(&mut dialog.limit_gb)
+                        .range(0..=100_000)
+                        .suffix(" GB"),
+                );
+                ui.weak("per pass, 4 passes (0 = everything chosen)");
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+                if ui
+                    .add_enabled(
+                        !dialog.inputs.is_empty(),
+                        egui::Button::new("Start benchmark"),
+                    )
+                    .clicked()
+                {
+                    start = true;
+                }
+            });
+        });
+        if start {
+            if let Some(d) = self.bench_dialog.take() {
+                self.bench_result = None;
+                let limit_bytes = d.limit_gb as u64 * 1024 * 1024 * 1024;
+                self.start_job(
+                    ctx,
+                    Job::Benchmark {
+                        inputs: d.inputs,
+                        limit_bytes,
+                    },
+                );
+            }
+        } else if cancel || modal.should_close() {
+            self.bench_dialog = None;
+        }
+    }
+
+    fn bench_window(&mut self, ctx: &egui::Context, live: Option<&State>) {
+        // While a benchmark runs, show its rows as they arrive.
+        let running = live.filter(|s| s.kind == JobKind::Benchmark && !s.bench.is_empty());
+        let (info, rows, cancelled) = match (running, &self.bench_result) {
+            (Some(s), _) => (s.bench_info.clone(), s.bench.clone(), false),
+            (None, Some((info, rows, cancelled))) => (info.clone(), rows.clone(), *cancelled),
+            (None, None) => return,
+        };
+        let mut open = true;
+        egui::Window::new("Benchmark results")
+            .open(&mut open)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.label(&info);
+                if cancelled {
+                    ui.colored_label(AMBER, "Cancelled: the list is incomplete.");
+                }
+                ui.add_space(6.0);
+                egui::Grid::new("bench")
+                    .striped(true)
+                    .num_columns(3)
+                    .show(ui, |ui| {
+                        ui.strong("Measurement");
+                        ui.strong("MB/s");
+                        ui.strong("Data");
+                        ui.end_row();
+                        for r in &rows {
+                            ui.label(&r.label);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.monospace(group_digits(r.mb_per_s().round() as u64));
+                                },
+                            );
+                            ui.label(format!("{} in {:.1} s", human_bytes(r.bytes), r.secs));
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(6.0);
+                if ui
+                    .button("Copy as Markdown")
+                    .on_hover_text("Copy this table to the clipboard, ready to paste.")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(bench_markdown(&info, &rows));
+                }
+            });
+        if !open {
+            self.bench_result = None;
+        }
+    }
+
     fn info_window(&mut self, ctx: &egui::Context) {
         let Some(msg) = self.info.clone() else { return };
         egui::Window::new("Report")
@@ -1524,6 +1832,35 @@ impl App {
                 }
             });
     }
+}
+
+const DIRECT_IO_HELP: &str = "Reads go straight to the drive instead of through the operating system's file \
+cache, so every byte checked really comes from the disk. Falls back to normal reads where a drive does not \
+support it. Use the benchmark to see which is faster on your drives.";
+
+const DRIVES_HELP: &str = "How many files are read at once on each drive. Hard disks are read one file at a \
+time, because parallel reads make the head seek back and forth; SSDs are read in parallel.";
+
+const BENCH_HELP_1: &str = "Pick existing files or a folder on the drive you want to measure. They are only \
+read, never changed, and nothing is added to the database. Large files give the most meaningful numbers.";
+
+const BENCH_HELP_2: &str = "Each algorithm reads the files once past the file cache (so the drive is really \
+measured), then BLAKE3 once more with normal reads, then every algorithm on data in memory to show what the \
+CPU alone can do. The drive is read with its setting from the Drives list.";
+
+/// The benchmark table as Markdown, for pasting into a message or the README.
+pub fn bench_markdown(info: &str, rows: &[BenchRow]) -> String {
+    let mut out = format!("{info}\n\n| Measurement | MB/s | Data |\n|---|---:|---|\n");
+    for r in rows {
+        out += &format!(
+            "| {} | {} | {} in {:.1} s |\n",
+            r.label,
+            group_digits(r.mb_per_s().round() as u64),
+            human_bytes(r.bytes),
+            r.secs
+        );
+    }
+    out
 }
 
 fn chip_name(status: Status) -> &'static str {
@@ -1570,6 +1907,7 @@ fn job_summary(s: &State) -> String {
             entries_word(s.files_done),
             format_duration(took)
         ),
+        JobKind::Benchmark => format!("{verdict}: benchmark took {}", format_duration(took)),
         JobKind::Export => match &s.report_path {
             Some(p) if s.fatal.is_none() => format!("Report saved: {}", p.display()),
             _ => "Report not saved".to_string(),
@@ -1628,7 +1966,10 @@ fn status_label(ui: &mut egui::Ui, e: &Entry) {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let dialog_open = self.confirm.is_some() || self.error.is_some() || self.export.is_some();
+        let dialog_open = self.confirm.is_some()
+            || self.error.is_some()
+            || self.export.is_some()
+            || self.bench_dialog.is_some();
 
         // Files dropped onto the window.
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -1652,6 +1993,7 @@ impl eframe::App for App {
         }
 
         let live = self.poll_job(&ctx);
+        let live_state = live.as_ref().map(|(s, _, _)| s.clone());
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(4.0);
@@ -1679,6 +2021,8 @@ impl eframe::App for App {
 
         self.confirm_dialog(&ctx);
         self.export_dialog(&ctx);
+        self.bench_dialog(&ctx);
+        self.bench_window(&ctx, live_state.as_ref());
         self.info_window(&ctx);
         self.problems_window(&ctx);
         self.about_window(&ctx);
