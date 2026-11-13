@@ -6,6 +6,8 @@
 //! - [`hasher`]  BLAKE3 / XXH3-128 / SHA-256 behind one streaming interface.
 //! - [`hashfile`] hashes one file through `fsread`, detecting changes mid-hash.
 //! - [`db`]      SQLite storage with schema versioning and pre-migration backups.
+//! - [`verify`]  classification of a re-hashed file; which volume a path is on.
+//! - [`report`]  CSV and text verification reports.
 //! - [`engine`]  background jobs with progress and cancellation.
 //! - [`fonts`]   fallback fonts for characters the built-in font lacks.
 //! - [`ui`]      the egui front end.
@@ -17,7 +19,9 @@ pub mod fonts;
 pub mod fsread;
 pub mod hasher;
 pub mod hashfile;
+pub mod report;
 pub mod ui;
 pub mod util;
+pub mod verify;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

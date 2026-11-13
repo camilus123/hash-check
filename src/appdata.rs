@@ -6,9 +6,11 @@
 //! from [`AppDir::dir`].
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 pub const DB_FILE: &str = "hash-check.db";
+pub const REPORTS_DIR: &str = "reports";
 
 #[derive(Clone, Debug)]
 pub struct AppDir {
@@ -57,5 +59,59 @@ impl AppDir {
                     self.dir.display()
                 )
             })
+    }
+
+    pub fn reports_dir(&self) -> PathBuf {
+        self.dir.join(REPORTS_DIR)
+    }
+
+    /// Create a new report file in the app's `reports` folder.
+    pub fn create_report(&self, file_name: &str) -> io::Result<(PathBuf, ReportWriter)> {
+        let dir = self.reports_dir();
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(file_name);
+        Ok((path.clone(), ReportWriter::start(&path)?))
+    }
+}
+
+/// A report being written. This is the one case where hash-check writes
+/// outside its own folder: when the user picks a location for a report.
+/// The file is always created new. An existing file is never opened,
+/// replaced or truncated, so this cannot damage anything already on disk.
+pub struct ReportWriter {
+    w: io::BufWriter<fs::File>,
+}
+
+impl ReportWriter {
+    pub fn start(path: &Path) -> io::Result<ReportWriter> {
+        let f = fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "a file with this name already exists; hash-check never overwrites files, please choose another name",
+                )
+            } else {
+                e
+            }
+        })?;
+        Ok(ReportWriter {
+            w: io::BufWriter::new(f),
+        })
+    }
+
+    /// Flush everything to disk; call when the report is complete.
+    pub fn finish(mut self) -> io::Result<()> {
+        io::Write::flush(&mut self.w)?;
+        self.w.get_ref().sync_all()
+    }
+}
+
+impl io::Write for ReportWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.w.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.w.flush()
     }
 }
