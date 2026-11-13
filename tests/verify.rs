@@ -657,8 +657,8 @@ fn cancelled_verify_keeps_what_it_checked_and_says_so() {
 #[test]
 fn reports_list_problems_first_and_never_overwrite() {
     let fx = fixture(Algo::Sha256);
-    // A name that would be trouble in a careless CSV writer.
-    fs::write(fx.data.join("=evil, \"quoted\".txt"), b"q").unwrap();
+    // A name that would be trouble in a careless CSV writer (and is legal on Windows).
+    fs::write(fx.data.join("=evil, name.txt"), b"q").unwrap();
     add_blocking(&fx.db_path, &[fx.data.clone()], true, Algo::Sha256);
     disturb(&fx);
     verify_all(&fx);
@@ -718,13 +718,10 @@ fn reports_list_problems_first_and_never_overwrite() {
     assert!(lines[1].contains("SHA-256"));
     let evil = lines.iter().find(|l| l.contains("evil")).unwrap();
     assert!(
-        evil.contains("\"\"quoted\"\""),
-        "quotes are doubled: {evil}"
+        evil.starts_with("OK,\""),
+        "a path containing a comma is quoted: {evil}"
     );
-    assert!(
-        evil.matches('"').count() >= 6,
-        "the field is quoted: {evil}"
-    );
+    assert!(evil.contains("=evil, name.txt\","), "{evil}");
 
     // Text to a location the "user" picked.
     let chosen = fx.data.parent().unwrap().join("my report.txt");
